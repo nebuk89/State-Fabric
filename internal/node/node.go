@@ -48,6 +48,34 @@ type TransitionRequest struct {
 	PolicyContext     string
 }
 
+type OperationalStats struct {
+	NodeID           string      `json:"node_id"`
+	Authority        bool        `json:"authority"`
+	Objects          store.Stats `json:"objects"`
+	Transitions      int         `json:"transitions"`
+	Receipts         int         `json:"receipts"`
+	AuthorityRecords int         `json:"authority_records"`
+	SharedRefs       int         `json:"shared_refs"`
+	DivergentRefs    int         `json:"divergent_refs"`
+}
+
+type AuditReport struct {
+	Objects     int `json:"objects"`
+	Transitions int `json:"transitions"`
+	Receipts    int `json:"receipts"`
+}
+
+type GCReport struct {
+	DryRun          bool     `json:"dry_run"`
+	GraceSeconds    int64    `json:"grace_seconds"`
+	Reachable       int      `json:"reachable_objects"`
+	Candidates      int      `json:"candidate_objects"`
+	CandidateBytes  int64    `json:"candidate_bytes"`
+	Deleted         int      `json:"deleted_objects"`
+	DeletedBytes    int64    `json:"deleted_bytes"`
+	CandidateObject []string `json:"candidate_object_ids"`
+}
+
 func Initialize(root string, authority bool, domainBundle *security.DomainConfig) (*Node, error) {
 	if _, err := os.Stat(filepath.Join(root, "config.json")); err == nil {
 		return nil, fmt.Errorf("node already initialized at %s", root)
@@ -201,6 +229,10 @@ func (node *Node) PutObject(object model.GraphObject, private bool) (string, err
 	return node.store.Put(object, private)
 }
 
+func (node *Node) ExpectedObjectID(object model.GraphObject, private bool) (string, error) {
+	return node.store.ExpectedID(object, private)
+}
+
 func (node *Node) GetObject(id string) (model.GraphObject, error) {
 	return node.store.Get(id)
 }
@@ -264,6 +296,20 @@ func (node *Node) CreateTransition(request TransitionRequest) (model.Transition,
 }
 
 func (node *Node) AcceptTransition(transition model.Transition) (model.EdgeReceipt, error) {
+	return node.acceptTransition(transition, model.Capability{})
+}
+
+func (node *Node) AcceptTransitionFor(
+	transition model.Transition,
+	acceptanceCapability model.Capability,
+) (model.EdgeReceipt, error) {
+	return node.acceptTransition(transition, acceptanceCapability)
+}
+
+func (node *Node) acceptTransition(
+	transition model.Transition,
+	acceptanceCapability model.Capability,
+) (model.EdgeReceipt, error) {
 	node.mu.Lock()
 	defer node.mu.Unlock()
 	var receipt model.EdgeReceipt
@@ -275,20 +321,25 @@ func (node *Node) AcceptTransition(transition model.Transition) (model.EdgeRecei
 			if err := node.localJournal.Reload(); err != nil {
 				return err
 			}
-			if err := node.verifyTransitionForAcceptance(transition, time.Now().UTC()); err != nil {
+			acceptedAt := time.Now().UTC()
+			if err := node.verifyTransitionForAcceptance(transition, acceptedAt); err != nil {
+				return err
+			}
+			if err := node.verifyAcceptanceCapability(transition, acceptanceCapability, acceptedAt); err != nil {
 				return err
 			}
 			if err := node.saveTransition(transition); err != nil {
 				return err
 			}
 			body := model.EdgeReceiptBody{
-				ProtocolVersion:     model.ProtocolVersion,
-				TransitionID:        transition.ID,
-				AcceptedBy:          node.NodeID(),
-				AcceptedAtUnix:      time.Now().UTC().Unix(),
-				DurabilityClass:     node.config.DurabilityClass,
-				ObjectsManifest:     transition.Body.RequiredObjectManifest,
-				AuthorityCheckpoint: node.authorityCheckpoint(),
+				ProtocolVersion:        model.ProtocolVersion,
+				TransitionID:           transition.ID,
+				AcceptedBy:             node.NodeID(),
+				AcceptedAtUnix:         acceptedAt.Unix(),
+				DurabilityClass:        node.config.DurabilityClass,
+				ObjectsManifest:        transition.Body.RequiredObjectManifest,
+				AuthorityCheckpoint:    node.authorityCheckpoint(),
+				AcceptanceCapabilityID: acceptanceCapability.ID,
 			}
 			id, err := model.CanonicalID("receipt:sha256:", body)
 			if err != nil {
@@ -299,10 +350,11 @@ func (node *Node) AcceptTransition(transition model.Transition) (model.EdgeRecei
 				return err
 			}
 			receipt = model.EdgeReceipt{
-				Body:          body,
-				ID:            id,
-				NodePublicKey: node.identity.PublicKey,
-				NodeSignature: signature,
+				Body:                 body,
+				ID:                   id,
+				NodePublicKey:        node.identity.PublicKey,
+				NodeSignature:        signature,
+				AcceptanceCapability: acceptanceCapability,
 			}
 			if err := node.stageReceipt(receipt); err != nil {
 				return err
@@ -391,6 +443,7 @@ func (node *Node) Finalize(transitionID string) (model.FinalizeResult, error) {
 			Namespace:      transition.Body.Namespace,
 			RefName:        intent.Name,
 			TransitionID:   transition.ID,
+			ReceiptID:      receipt.ID,
 			Expected:       expected,
 			RecordedAtUnix: time.Now().UTC().Unix(),
 		}
@@ -531,6 +584,227 @@ func (node *Node) VerifyObjectClosure(root string) ([]string, error) {
 	return node.store.VerifyClosure([]string{root})
 }
 
+func (node *Node) OperationalStats() (OperationalStats, error) {
+	objectStats, err := node.store.Stats()
+	if err != nil {
+		return OperationalStats{}, err
+	}
+	transitions, err := countJSONFiles(filepath.Join(node.root, "transitions"))
+	if err != nil {
+		return OperationalStats{}, err
+	}
+	receipts, err := countJSONFiles(filepath.Join(node.root, "receipts"))
+	if err != nil {
+		return OperationalStats{}, err
+	}
+	records, err := node.AuthorityRecords()
+	if err != nil {
+		return OperationalStats{}, err
+	}
+	refs, divergent, err := node.Refs()
+	if err != nil {
+		return OperationalStats{}, err
+	}
+	return OperationalStats{
+		NodeID:           node.NodeID(),
+		Authority:        node.IsAuthority(),
+		Objects:          objectStats,
+		Transitions:      transitions,
+		Receipts:         receipts,
+		AuthorityRecords: len(records),
+		SharedRefs:       len(refs),
+		DivergentRefs:    len(divergent),
+	}, nil
+}
+
+func (node *Node) Audit() (AuditReport, error) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	var report AuditReport
+	err := filelock.With(node.authorityLockPath(), func() error {
+		if err := node.reloadAuthorityState(); err != nil {
+			return err
+		}
+		objects, err := node.store.Objects()
+		if err != nil {
+			return err
+		}
+		for _, object := range objects {
+			if _, err := node.store.Get(object.ID); err != nil {
+				return fmt.Errorf("verify object %s: %w", object.ID, err)
+			}
+		}
+		report.Objects = len(objects)
+		entries, err := os.ReadDir(filepath.Join(node.root, "transitions"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			var transition model.Transition
+			if err := security.Load(filepath.Join(node.root, "transitions", entry.Name()), &transition); err != nil {
+				return err
+			}
+			if err := node.verifyTransitionIntegrity(transition); err != nil {
+				return fmt.Errorf("verify transition %s: %w", transition.ID, err)
+			}
+			report.Transitions++
+		}
+		receiptEntries, err := os.ReadDir(filepath.Join(node.root, "receipts"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, entry := range receiptEntries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			var receipt model.EdgeReceipt
+			if err := security.Load(filepath.Join(node.root, "receipts", entry.Name()), &receipt); err != nil {
+				return err
+			}
+			transition, err := node.loadTransition(receipt.Body.TransitionID)
+			if err != nil {
+				return err
+			}
+			if err := node.verifyReceipt(receipt, transition); err != nil {
+				return fmt.Errorf("verify receipt %s: %w", receipt.ID, err)
+			}
+			if err := node.verifyAuthorizationAtReceipt(transition, receipt); err != nil {
+				return fmt.Errorf("verify receipt authorization %s: %w", receipt.ID, err)
+			}
+			report.Receipts++
+		}
+		if err := filelock.With(node.localLockPath(), func() error {
+			if err := node.localJournal.Reload(); err != nil {
+				return err
+			}
+			for _, record := range node.localJournal.Records() {
+				if record.Body.Type != "accepted" {
+					continue
+				}
+				transition, err := node.loadTransition(record.Body.TransitionID)
+				if err != nil {
+					return fmt.Errorf("accepted journal record %s lost transition: %w", record.ID, err)
+				}
+				if transition.ID != record.Body.TransitionID {
+					return fmt.Errorf("accepted journal record %s transition ID mismatch", record.ID)
+				}
+				var receipt model.EdgeReceipt
+				if err := security.Load(node.receiptPath(record.Body.ReceiptID), &receipt); err != nil {
+					return fmt.Errorf("accepted journal record %s lost receipt: %w", record.ID, err)
+				}
+				if receipt.ID != record.Body.ReceiptID {
+					return fmt.Errorf("accepted journal record %s receipt ID mismatch", record.ID)
+				}
+				if err := node.verifyReceipt(receipt, transition); err != nil {
+					return fmt.Errorf("accepted journal receipt %s: %w", receipt.ID, err)
+				}
+				if err := node.verifyAuthorizationAtReceipt(transition, receipt); err != nil {
+					return fmt.Errorf("accepted journal authorization %s: %w", receipt.ID, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if node.config.IsAuthority {
+			for _, record := range node.authorityJournal.Records() {
+				if record.Body.Type != "finalized" && record.Body.Type != "divergent" {
+					continue
+				}
+				transition, err := node.loadTransition(record.Body.TransitionID)
+				if err != nil {
+					return fmt.Errorf("authority record %s lost transition: %w", record.ID, err)
+				}
+				if transition.ID != record.Body.TransitionID {
+					return fmt.Errorf("authority record %s transition ID mismatch", record.ID)
+				}
+				if err := node.verifyTransitionIntegrity(transition); err != nil {
+					return fmt.Errorf("authority transition %s: %w", transition.ID, err)
+				}
+				var receipt model.EdgeReceipt
+				if err := security.Load(node.receiptPath(record.Body.ReceiptID), &receipt); err != nil {
+					return fmt.Errorf("authority record %s lost receipt: %w", record.ID, err)
+				}
+				if receipt.ID != record.Body.ReceiptID {
+					return fmt.Errorf("authority record %s receipt ID mismatch", record.ID)
+				}
+				if err := node.verifyReceipt(receipt, transition); err != nil {
+					return fmt.Errorf("authority record %s receipt: %w", record.ID, err)
+				}
+				if err := node.verifyAuthorizationAtReceipt(transition, receipt); err != nil {
+					return fmt.Errorf("authority receipt authorization %s: %w", receipt.ID, err)
+				}
+			}
+		}
+		return nil
+	})
+	return report, err
+}
+
+func (node *Node) GarbageCollect(grace time.Duration, dryRun bool) (GCReport, error) {
+	if grace < 0 {
+		return GCReport{}, errors.New("garbage-collection grace period cannot be negative")
+	}
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	report := GCReport{
+		DryRun:       dryRun,
+		GraceSeconds: int64(grace.Seconds()),
+	}
+	err := filelock.With(filepath.Join(node.root, "objects", "gc.lock"), func() error {
+		reachable := make(map[string]struct{})
+		entries, err := os.ReadDir(filepath.Join(node.root, "transitions"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			var transition model.Transition
+			if err := security.Load(filepath.Join(node.root, "transitions", entry.Name()), &transition); err != nil {
+				return err
+			}
+			closure, err := node.store.VerifyClosure([]string{transition.Body.RequiredObjectManifest})
+			if err != nil {
+				return err
+			}
+			for _, id := range closure {
+				reachable[id] = struct{}{}
+			}
+		}
+		report.Reachable = len(reachable)
+		objects, err := node.store.Objects()
+		if err != nil {
+			return err
+		}
+		cutoff := time.Now().UTC().Add(-grace)
+		for _, object := range objects {
+			if _, ok := reachable[object.ID]; ok || object.Modified.After(cutoff) {
+				continue
+			}
+			report.Candidates++
+			report.CandidateBytes += object.Size
+			if len(report.CandidateObject) < 100 {
+				report.CandidateObject = append(report.CandidateObject, object.ID)
+			}
+			if dryRun {
+				continue
+			}
+			if err := node.store.Delete(object.ID); err != nil {
+				return err
+			}
+			report.Deleted++
+			report.DeletedBytes += object.Size
+		}
+		return nil
+	})
+	return report, err
+}
+
 func (node *Node) verifyTransitionForAcceptance(transition model.Transition, acceptedAt time.Time) error {
 	if err := node.verifyTransitionIntegrity(transition); err != nil {
 		return err
@@ -613,8 +887,26 @@ func (node *Node) verifyReceipt(receipt model.EdgeReceipt, transition model.Tran
 		receipt.Body.DurabilityClass != "host-disk" {
 		return errors.New("receipt does not bind the transition")
 	}
-	if receipt.NodePublicKey != transition.Body.ActorPublicKey {
-		return errors.New("v0 receipt signer must be the capability subject")
+	if receipt.NodePublicKey == transition.Body.ActorPublicKey {
+		if receipt.Body.AcceptanceCapabilityID != "" || receipt.AcceptanceCapability.ID != "" {
+			return errors.New("self-accepted receipt must not carry an edge capability")
+		}
+	} else {
+		if receipt.Body.AcceptanceCapabilityID == "" ||
+			receipt.Body.AcceptanceCapabilityID != receipt.AcceptanceCapability.ID {
+			return errors.New("independent receipt does not bind an acceptance capability")
+		}
+		acceptedAt := time.Unix(receipt.Body.AcceptedAtUnix, 0).UTC()
+		if err := security.VerifyCapability(
+			node.domain,
+			receipt.AcceptanceCapability,
+			receipt.NodePublicKey,
+			transition.Body.Namespace,
+			"receipt.issue",
+			acceptedAt,
+		); err != nil {
+			return fmt.Errorf("acceptance capability: %w", err)
+		}
 	}
 	expectedNodeID, err := security.NodeIDForPublicKey(receipt.NodePublicKey)
 	if err != nil {
@@ -657,7 +949,45 @@ func (node *Node) verifyAuthorizationAtReceipt(transition model.Transition, rece
 			return errors.New("accepting edge had observed capability revocation")
 		}
 	}
+	if receipt.AcceptanceCapability.ID != "" {
+		if revokedSequence, revoked := node.revoked[receipt.AcceptanceCapability.ID]; revoked {
+			checkpointSequence, err := node.authorityCheckpointSequence(receipt.Body.AuthorityCheckpoint)
+			if err != nil {
+				return err
+			}
+			if checkpointSequence >= revokedSequence {
+				return errors.New("accepting edge had observed acceptance-capability revocation")
+			}
+		}
+	}
 	return nil
+}
+
+func (node *Node) verifyAcceptanceCapability(
+	transition model.Transition,
+	capability model.Capability,
+	acceptedAt time.Time,
+) error {
+	if node.identity.PublicKey == transition.Body.ActorPublicKey {
+		if capability.ID != "" {
+			return errors.New("self-acceptance does not use a separate edge capability")
+		}
+		return nil
+	}
+	if capability.ID == "" {
+		return errors.New("independent edge acceptance requires a receipt.issue capability")
+	}
+	if _, revoked := node.revoked[capability.ID]; revoked {
+		return errors.New("acceptance capability has been revoked")
+	}
+	return security.VerifyCapability(
+		node.domain,
+		capability,
+		node.identity.PublicKey,
+		transition.Body.Namespace,
+		"receipt.issue",
+		acceptedAt,
+	)
 }
 
 func (node *Node) verifyParents(transition model.Transition) error {
@@ -903,6 +1233,23 @@ func (node *Node) authorityCheckpointSequence(checkpoint string) (uint64, error)
 
 func (node *Node) localLockPath() string {
 	return filepath.Join(node.root, "journal", "local.lock")
+}
+
+func countJSONFiles(directory string) (int, error) {
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (node *Node) authorityLockPath() string {

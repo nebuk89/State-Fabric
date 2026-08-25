@@ -19,7 +19,7 @@ asynchronous finality.
 
 ## What exists
 
-The OSS v0 proves:
+The OSS v0.1 public beta proves:
 
 - immutable Source, Workspace, and Provenance graph roots;
 - node-local signed host-disk durability receipts;
@@ -28,12 +28,35 @@ The OSS v0 proves:
 - authenticated HTTP replication;
 - deterministic conflict preservation and merge convergence;
 - public and trust-domain-private object identities;
-- Git SHA-1 and SHA-256 snapshot projection.
+- Git SHA-1 and SHA-256 snapshot projection;
+- content-defined workspace chunks and layered delta manifests;
+- constant-time metadata forks and safe workspace materialization;
+- independent edge receipts authorized with `receipt.issue`;
+- process-isolated actor, edge, and authority operation over TCP;
+- TLS peers with explicit CA trust;
+- full node audit, operational stats, and offline reachability GC.
 
-It does not yet prove the product's differentiated value. Workspace snapshots are
-whole-file objects, receipt signer and transition actor are the same node, and the
-demo runs on one host. No real workload has yet demonstrated lower task latency,
-origin traffic, or cost.
+It does not yet prove the product's differentiated value on a real fleet. There
+is no live demand-paged mount, the process proof still runs on one host, and no
+representative workload has demonstrated lower task latency, origin traffic, or
+cost.
+
+## v0.1 implementation progress
+
+| Backlog area | Status |
+|---|---|
+| Layered workspace manifest and content-defined chunks | Implemented and tested |
+| Metadata-only fork and copy-on-write delta capture | Implemented and tested |
+| Safe workspace materialization | Implemented and tested |
+| Independent actor and accepting-edge identities | Implemented and tested across OS processes |
+| Delegated `receipt.issue` capability | Implemented and tested |
+| TLS server and explicit client CA | Implemented and tested |
+| Audit, stats, and offline reachability GC | Implemented and tested |
+| Live demand hydration and read-byte telemetry | Not started |
+| Multi-host fault campaign | Not started |
+| Durability-class evidence beyond host-disk | Not started |
+| Fleet contention and reconciliation study | Not started |
+| Design-partner workload and economics | Not started |
 
 ## Decision gates
 
@@ -63,17 +86,16 @@ Each phase must earn the right to fund the next one.
 
 ### Days 31-60: prove warm-workspace value
 
-- Replace whole-file workspace snapshots with a layered extent/chunk graph.
-- Add constant-time copy-on-write workspace forks.
+- Integrate the layered chunk graph and metadata forks into a real agent runtime.
 - Add demand-paged hydration and read-byte accounting.
 - Run a real agent task against a 50+ GiB logical workspace.
 - Demonstrate the G1 target and run edge/authority/cache on separate hosts for G2.
 
 ### Days 61-90: prove distributed trust and concurrency
 
-- Separate actor identity from accepting-edge identity.
-- Issue receipts from an independent edge with an explicit durability class.
-- Build crash-boundary and kill-the-host durability tests.
+- Run independent actor/edge receipts across separate physical hosts.
+- Extend durability evidence beyond the current signed `host-disk` class.
+- Build power-loss and kill-the-host durability tests.
 - Run 10+ concurrent agents against one namespace/ref.
 - Measure divergent heads, automated resolutions, human interventions, and time
   to convergence.
@@ -193,7 +215,7 @@ Do not spend roadmap capacity on these until G0-G4 pass:
 **Stop**
 
 - leading with the protocol instead of a fleet operator's task latency and cost;
-- describing v0 self-acceptance as independent nearby-node durability;
+- presenting a functional public beta as proof of real-fleet performance;
 - expanding generic Git compatibility before the native agent workflow works.
 
 **Continue**

@@ -12,7 +12,10 @@ import (
 	"github.com/nebuk89/cdn_git/internal/canonical"
 )
 
-const ProtocolVersion = "0.1"
+const (
+	ProtocolVersion    = "0.1"
+	MaxGraphObjectSize = 48 << 20
+)
 
 var namespacePattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
@@ -188,20 +191,22 @@ func (transition Transition) ValidateShape() error {
 }
 
 type EdgeReceiptBody struct {
-	ProtocolVersion     string `json:"protocol_version"`
-	TransitionID        string `json:"transition_id"`
-	AcceptedBy          string `json:"accepted_by"`
-	AcceptedAtUnix      int64  `json:"accepted_at_unix"`
-	DurabilityClass     string `json:"durability_class"`
-	ObjectsManifest     string `json:"objects_manifest"`
-	AuthorityCheckpoint string `json:"authority_checkpoint"`
+	ProtocolVersion        string `json:"protocol_version"`
+	TransitionID           string `json:"transition_id"`
+	AcceptedBy             string `json:"accepted_by"`
+	AcceptedAtUnix         int64  `json:"accepted_at_unix"`
+	DurabilityClass        string `json:"durability_class"`
+	ObjectsManifest        string `json:"objects_manifest"`
+	AuthorityCheckpoint    string `json:"authority_checkpoint"`
+	AcceptanceCapabilityID string `json:"acceptance_capability_id"`
 }
 
 type EdgeReceipt struct {
-	Body          EdgeReceiptBody `json:"body"`
-	ID            string          `json:"id"`
-	NodePublicKey string          `json:"node_public_key"`
-	NodeSignature string          `json:"node_signature"`
+	Body                 EdgeReceiptBody `json:"body"`
+	ID                   string          `json:"id"`
+	NodePublicKey        string          `json:"node_public_key"`
+	NodeSignature        string          `json:"node_signature"`
+	AcceptanceCapability Capability      `json:"acceptance_capability"`
 }
 
 type JournalRecordBody struct {

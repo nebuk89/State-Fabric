@@ -3,12 +3,15 @@ package transport
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -37,6 +40,16 @@ type finalizeRequest struct {
 	TransitionID string `json:"transition_id"`
 }
 
+type acceptRequest struct {
+	Transition           model.Transition `json:"transition"`
+	AcceptanceCapability model.Capability `json:"acceptance_capability"`
+}
+
+type acceptResponse struct {
+	Receipt          model.EdgeReceipt     `json:"receipt"`
+	AuthorityRecords []model.JournalRecord `json:"authority_records"`
+}
+
 type authorityResponse struct {
 	Records []model.JournalRecord `json:"records"`
 }
@@ -57,9 +70,11 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v0/objects", server.auth(server.putObject))
 	mux.HandleFunc("GET /v0/transitions/{id}", server.auth(server.getTransition))
 	mux.HandleFunc("POST /v0/transitions", server.auth(server.putTransition))
+	mux.HandleFunc("POST /v0/accept", server.auth(server.accept))
 	mux.HandleFunc("POST /v0/finalize", server.auth(server.finalize))
 	mux.HandleFunc("GET /v0/authority", server.auth(server.authority))
 	mux.HandleFunc("GET /v0/refs", server.auth(server.refs))
+	mux.HandleFunc("GET /v0/stats", server.auth(server.stats))
 	return mux
 }
 
@@ -109,13 +124,22 @@ func (server *Server) putObject(response http.ResponseWriter, request *http.Requ
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	id, err := server.node.PutObject(envelope.Object, envelope.Private)
+	if envelope.Private != strings.HasPrefix(envelope.ID, "priv:") {
+		writeError(response, http.StatusUnprocessableEntity, errors.New("object ID privacy does not match envelope"))
+		return
+	}
+	expectedID, err := server.node.ExpectedObjectID(envelope.Object, envelope.Private)
 	if err != nil {
 		writeError(response, http.StatusUnprocessableEntity, err)
 		return
 	}
-	if id != envelope.ID {
+	if expectedID != envelope.ID {
 		writeError(response, http.StatusConflict, errors.New("object ID does not match canonical content"))
+		return
+	}
+	id, err := server.node.PutObject(envelope.Object, envelope.Private)
+	if err != nil {
+		writeError(response, http.StatusUnprocessableEntity, err)
 		return
 	}
 	writeJSON(response, http.StatusCreated, struct {
@@ -152,6 +176,28 @@ func (server *Server) putTransition(response http.ResponseWriter, request *http.
 	}{TransitionID: envelope.Transition.ID})
 }
 
+func (server *Server) accept(response http.ResponseWriter, request *http.Request) {
+	var input acceptRequest
+	if err := decodeJSON(response, request, &input); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	receipt, err := server.node.AcceptTransitionFor(input.Transition, input.AcceptanceCapability)
+	if err != nil {
+		writeError(response, http.StatusUnprocessableEntity, err)
+		return
+	}
+	records, err := server.node.AuthorityRecords()
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, acceptResponse{
+		Receipt:          receipt,
+		AuthorityRecords: records,
+	})
+}
+
 func (server *Server) finalize(response http.ResponseWriter, request *http.Request) {
 	var input finalizeRequest
 	if err := decodeJSON(response, request, &input); err != nil {
@@ -182,6 +228,15 @@ func (server *Server) refs(response http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(response, http.StatusOK, refsResponse{Refs: refs, Divergent: divergent})
+}
+
+func (server *Server) stats(response http.ResponseWriter, _ *http.Request) {
+	stats, err := server.node.OperationalStats()
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, stats)
 }
 
 func decodeJSON(response http.ResponseWriter, request *http.Request, destination any) error {
@@ -221,8 +276,34 @@ func NewClient(peerToken string) *Client {
 	}
 }
 
+func NewClientWithCA(peerToken, caPath string) (*Client, error) {
+	certificate, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, err
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, err
+	}
+	if !roots.AppendCertsFromPEM(certificate) {
+		return nil, errors.New("CA file contains no valid certificates")
+	}
+	return &Client{
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					MinVersion: tls.VersionTLS13,
+					RootCAs:    roots,
+				},
+			},
+		},
+		peerToken: peerToken,
+	}, nil
+}
+
 func (client *Client) SyncTransition(ctx context.Context, local *node.Node, peerURL, transitionID string) error {
-	return client.syncTransition(ctx, local, peerURL, transitionID, make(map[string]struct{}))
+	return client.syncTransition(ctx, local, peerURL, transitionID, true, make(map[string]struct{}))
 }
 
 func (client *Client) syncTransition(
@@ -230,6 +311,7 @@ func (client *Client) syncTransition(
 	local *node.Node,
 	peerURL string,
 	transitionID string,
+	includeReceipt bool,
 	visited map[string]struct{},
 ) error {
 	if _, ok := visited[transitionID]; ok {
@@ -241,7 +323,7 @@ func (client *Client) syncTransition(
 		return err
 	}
 	for _, parentID := range transition.Body.ParentTransitions {
-		if err := client.syncTransition(ctx, local, peerURL, parentID, visited); err != nil {
+		if err := client.syncTransition(ctx, local, peerURL, parentID, true, visited); err != nil {
 			return fmt.Errorf("replicate parent %s: %w", parentID, err)
 		}
 	}
@@ -263,6 +345,9 @@ func (client *Client) syncTransition(
 			return fmt.Errorf("replicate object %s: %w", id, err)
 		}
 	}
+	if !includeReceipt {
+		return nil
+	}
 	receipt, err := local.ReceiptForTransition(transitionID)
 	if err != nil {
 		return err
@@ -272,6 +357,59 @@ func (client *Client) syncTransition(
 		Receipt:    receipt,
 	}, nil); err != nil {
 		return fmt.Errorf("replicate transition: %w", err)
+	}
+	return nil
+}
+
+func (client *Client) AcceptTransition(
+	ctx context.Context,
+	local *node.Node,
+	peerURL string,
+	transitionID string,
+	acceptanceCapability model.Capability,
+) (model.EdgeReceipt, error) {
+	if err := client.syncTransition(
+		ctx,
+		local,
+		peerURL,
+		transitionID,
+		false,
+		make(map[string]struct{}),
+	); err != nil {
+		return model.EdgeReceipt{}, err
+	}
+	transition, err := local.LoadTransition(transitionID)
+	if err != nil {
+		return model.EdgeReceipt{}, err
+	}
+	var response acceptResponse
+	if err := client.post(ctx, peerURL+"/v0/accept", acceptRequest{
+		Transition:           transition,
+		AcceptanceCapability: acceptanceCapability,
+	}, &response); err != nil {
+		return model.EdgeReceipt{}, err
+	}
+	if err := reconcileAuthorityRecords(local, response.AuthorityRecords); err != nil {
+		return model.EdgeReceipt{}, fmt.Errorf("import accepting edge authority journal: %w", err)
+	}
+	if err := local.IngestTransition(transition, response.Receipt); err != nil {
+		return model.EdgeReceipt{}, fmt.Errorf("verify returned receipt: %w", err)
+	}
+	return response.Receipt, nil
+}
+
+func reconcileAuthorityRecords(local *node.Node, remote []model.JournalRecord) error {
+	current, err := local.AuthorityRecords()
+	if err != nil {
+		return err
+	}
+	if len(remote) >= len(current) {
+		return local.ImportAuthorityRecords(remote)
+	}
+	for index := range remote {
+		if remote[index].ID != current[index].ID {
+			return errors.New("authority journal history fork detected")
+		}
 	}
 	return nil
 }
@@ -296,6 +434,12 @@ func (client *Client) PeerRefs(ctx context.Context, peerURL string) (map[string]
 		return nil, nil, err
 	}
 	return response.Refs, response.Divergent, nil
+}
+
+func (client *Client) PeerStats(ctx context.Context, peerURL string) (node.OperationalStats, error) {
+	var response node.OperationalStats
+	err := client.get(ctx, peerURL+"/v0/stats", &response)
+	return response, err
 }
 
 func (client *Client) get(ctx context.Context, endpoint string, destination any) error {

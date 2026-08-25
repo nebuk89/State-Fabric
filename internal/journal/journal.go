@@ -25,6 +25,11 @@ type Log struct {
 	records      []model.JournalRecord
 }
 
+type persistedHead struct {
+	Sequence uint64 `json:"sequence"`
+	RecordID string `json:"record_id"`
+}
+
 func Open(path, signerPublic string, sign SignFunc) (*Log, error) {
 	log := &Log{
 		path:         path,
@@ -37,6 +42,12 @@ func Open(path, signerPublic string, sign SignFunc) (*Log, error) {
 	}
 	if err := verifyRecords(records, signerPublic); err != nil {
 		return nil, fmt.Errorf("verify journal %s: %w", path, err)
+	}
+	if err := verifyPersistedHead(path, records); err != nil {
+		return nil, fmt.Errorf("verify journal head %s: %w", path, err)
+	}
+	if err := persistHead(path, records); err != nil {
+		return nil, err
 	}
 	log.records = records
 	return log, nil
@@ -74,6 +85,9 @@ func (log *Log) Append(body model.JournalRecordBody) (model.JournalRecord, error
 		return model.JournalRecord{}, err
 	}
 	log.records = append(log.records, record)
+	if err := persistHead(log.path, log.records); err != nil {
+		return model.JournalRecord{}, err
+	}
 	return record, nil
 }
 
@@ -91,6 +105,15 @@ func (log *Log) Reload() error {
 		return err
 	}
 	if err := verifyRecords(records, log.signerPublic); err != nil {
+		return err
+	}
+	if err := verifyExtension(log.records, records); err != nil {
+		return err
+	}
+	if err := verifyPersistedHead(log.path, records); err != nil {
+		return err
+	}
+	if err := persistHead(log.path, records); err != nil {
 		return err
 	}
 	log.records = records
@@ -117,8 +140,57 @@ func (log *Log) Import(records []model.JournalRecord) error {
 	if err := replaceRecords(log.path, records); err != nil {
 		return err
 	}
+	if err := persistHead(log.path, records); err != nil {
+		return err
+	}
 	log.records = append([]model.JournalRecord(nil), records...)
 	return nil
+}
+
+func verifyExtension(expected, records []model.JournalRecord) error {
+	if len(records) < len(expected) {
+		return errors.New("journal truncation detected")
+	}
+	for index := range expected {
+		if subtle.ConstantTimeCompare([]byte(expected[index].ID), []byte(records[index].ID)) != 1 {
+			return errors.New("journal history fork detected")
+		}
+	}
+	return nil
+}
+
+func verifyPersistedHead(path string, records []model.JournalRecord) error {
+	var head persistedHead
+	if err := security.Load(headPath(path), &head); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if head.Sequence == 0 || head.RecordID == "" {
+		return errors.New("invalid persisted journal head")
+	}
+	if uint64(len(records)) < head.Sequence {
+		return errors.New("journal truncation detected")
+	}
+	if records[head.Sequence-1].ID != head.RecordID {
+		return errors.New("journal history fork detected")
+	}
+	return nil
+}
+
+func persistHead(path string, records []model.JournalRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	latest := records[len(records)-1]
+	return security.Save(headPath(path), persistedHead{
+		Sequence: latest.Body.Sequence,
+		RecordID: latest.ID,
+	}, 0o600)
+}
+
+func headPath(path string) string {
+	return path + ".head"
 }
 
 func verifyRecords(records []model.JournalRecord, signerPublic string) error {

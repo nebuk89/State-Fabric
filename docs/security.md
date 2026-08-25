@@ -10,7 +10,7 @@ Private objects have domain-scoped opaque handles and encrypted payloads.
 Two trust domains storing identical private plaintext produce different handles.
 Two nodes in the same domain produce the same handle and can deduplicate.
 
-## Keys in v0
+## Keys in v0.1
 
 An authority creates:
 
@@ -51,10 +51,12 @@ Capabilities are signed by the authority and bind:
 - issue and expiry time;
 - delegation depth.
 
-v0 transitions require `transition.accept`. Capability revocations are signed
-authority-journal events and apply to subsequent transition acceptance.
+Actor transitions require `transition.accept`. An independent accepting edge
+requires `receipt.issue`; its capability ID is bound into the signed receipt.
+Capability revocations are signed authority-journal events and apply to
+subsequent acceptance.
 
-## Threats covered by v0
+## Threats covered by v0.1
 
 - object mutation under an existing ID;
 - private plaintext at rest;
@@ -64,10 +66,13 @@ authority-journal events and apply to subsequent transition acceptance.
 - journal truncation/fork import;
 - unauthenticated peer API access;
 - acknowledged state disappearing after a normal restart.
+- an unauthorized edge issuing durability for another actor;
+- transport interception when operators configure TLS 1.3 and validate an
+  explicit CA.
 
 ## Deferred production controls
 
-- TLS/mTLS and workload identity;
+- per-node mTLS and workload identity;
 - KMS/HSM-backed keys;
 - per-cache attenuated read capabilities;
 - key rotation and cryptographic deletion workflows;
@@ -75,3 +80,8 @@ authority-journal events and apply to subsequent transition acceptance.
 - hostile-machine and memory-extraction protection;
 - Byzantine authority consensus or transparency witnesses;
 - process-kill and power-loss certification for every filesystem/platform.
+
+The journal-head sidecar detects rollback of the JSONL file to an older signed
+prefix. An attacker able to restore both the journal and its sidecar together
+can only be detected by a future external transparency witness or
+hardware-backed monotonic checkpoint.

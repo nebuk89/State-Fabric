@@ -3,9 +3,11 @@ package journal
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/nebuk89/cdn_git/internal/canonical"
 	"github.com/nebuk89/cdn_git/internal/model"
 	"github.com/nebuk89/cdn_git/internal/security"
 )
@@ -81,4 +83,33 @@ func TestReadOnlyJournalImportsAuthorityPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = base64.RawURLEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
+}
+
+func TestJournalRejectsRollbackToSignedPrefix(t *testing.T) {
+	identity, err := security.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "authority.log")
+	log, err := Open(path, identity.PublicKey, identity.Sign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := log.Append(model.JournalRecordBody{Type: "finalized", TransitionID: "txn:one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(model.JournalRecordBody{Type: "finalized", TransitionID: "txn:two"}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := canonical.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, identity.PublicKey, identity.Sign); err == nil {
+		t.Fatal("journal accepted rollback to an older signed prefix")
+	}
 }

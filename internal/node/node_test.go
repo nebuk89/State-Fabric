@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nebuk89/cdn_git/internal/model"
+	"github.com/nebuk89/cdn_git/internal/security"
 )
 
 func TestAcceptedTransitionSurvivesRestart(t *testing.T) {
@@ -602,6 +603,150 @@ func TestReceiptLookupReloadsAuthorityCheckpoint(t *testing.T) {
 	}
 	if _, err := staleReader.ReceiptForTransition(child.ID); err != nil {
 		t.Fatalf("stale receipt reader did not reload authority checkpoint: %v", err)
+	}
+}
+
+func TestAuditStatsAndGarbageCollection(t *testing.T) {
+	authority, err := Initialize(filepath.Join(t.TempDir(), "authority"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := authority.PutObject(
+		model.NewGraphObject(model.KindSource, "text/plain", []byte("orphan"), nil),
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := authority.IssueCapability(
+		authority.PublicKey(),
+		"operations",
+		[]string{"transition.accept"},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := authority.CreateTransition(TransitionRequest{
+		Namespace:  "operations",
+		Roots:      putRoots(t, authority, "reachable"),
+		RefName:    "refs/heads/main",
+		Capability: capability,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := authority.OperationalStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Transitions != 1 || stats.Receipts != 1 ||
+		stats.Objects.PublicObjects == 0 || stats.Objects.PrivateObjects == 0 {
+		t.Fatalf("unexpected operational stats: %+v", stats)
+	}
+	audit, err := authority.Audit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.Transitions != 1 || audit.Receipts != 1 || audit.Objects == 0 {
+		t.Fatalf("unexpected audit report: %+v", audit)
+	}
+	dryRun, err := authority.GarbageCollect(0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dryRun.Candidates != 1 || dryRun.Deleted != 0 {
+		t.Fatalf("unexpected dry-run report: %+v", dryRun)
+	}
+	if _, err := authority.GetObject(orphan); err != nil {
+		t.Fatalf("dry-run deleted the orphan: %v", err)
+	}
+	applied, err := authority.GarbageCollect(0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Deleted != 1 {
+		t.Fatalf("unexpected applied report: %+v", applied)
+	}
+	if _, err := authority.GetObject(orphan); err == nil {
+		t.Fatal("applied garbage collection retained orphan object")
+	}
+	if _, err := authority.Audit(); err != nil {
+		t.Fatalf("garbage collection damaged reachable state: %v", err)
+	}
+}
+
+func TestAuditDetectsReceiptLostAfterAcknowledgement(t *testing.T) {
+	authority, err := Initialize(filepath.Join(t.TempDir(), "authority"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := authority.IssueCapability(
+		authority.PublicKey(),
+		"audit-loss",
+		[]string{"transition.accept"},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, receipt, err := authority.CreateTransition(TransitionRequest{
+		Namespace:  "audit-loss",
+		Roots:      putRoots(t, authority, "audit-loss"),
+		RefName:    "refs/heads/main",
+		Capability: capability,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Finalize(transition.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(authority.receiptPath(receipt.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Audit(); err == nil {
+		t.Fatal("audit did not detect a receipt lost after acknowledgement")
+	}
+}
+
+func TestAuditBindsAuthorityRecordToExactReceipt(t *testing.T) {
+	authority, err := Initialize(filepath.Join(t.TempDir(), "authority"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := authority.IssueCapability(
+		authority.PublicKey(),
+		"audit-binding",
+		[]string{"transition.accept"},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, original, err := authority.CreateTransition(TransitionRequest{
+		Namespace:  "audit-binding",
+		Roots:      putRoots(t, authority, "audit-binding"),
+		RefName:    "refs/heads/main",
+		Capability: capability,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Finalize(transition.ID); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := authority.AcceptTransition(transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.ID == original.ID {
+		t.Fatal("test did not produce a distinct valid receipt")
+	}
+	if err := security.Save(authority.receiptPath(original.ID), replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Audit(); err == nil {
+		t.Fatal("audit accepted a different valid receipt at the journal-referenced path")
 	}
 }
 

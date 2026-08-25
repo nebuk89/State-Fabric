@@ -175,6 +175,32 @@ func TestSnapshotRejectsFabricDataRootRepository(t *testing.T) {
 	}
 }
 
+func TestSnapshotRejectsTrackedBlobAboveTransportLimit(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "repo")
+	if err := os.Mkdir(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "init", "-q")
+	runGit(t, repository, "config", "user.name", "Fabric Test")
+	runGit(t, repository, "config", "user.email", "fabric@example.com")
+	if err := os.WriteFile(
+		filepath.Join(repository, "oversized.bin"),
+		bytes.Repeat([]byte{'x'}, maxGitBlobSize+1),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "oversized.bin")
+	runGit(t, repository, "commit", "-q", "-m", "oversized")
+	current, err := node.Initialize(filepath.Join(t.TempDir(), "fabric"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SnapshotRepository(current, repository, "HEAD", []byte("{}"), false, true); err == nil {
+		t.Fatal("snapshot accepted a tracked blob larger than the transport-safe limit")
+	}
+}
+
 func TestExportRejectsExistingDestination(t *testing.T) {
 	repository := filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(repository, 0o755); err != nil {

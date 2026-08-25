@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,9 +19,13 @@ import (
 	"github.com/nebuk89/cdn_git/internal/canonical"
 	"github.com/nebuk89/cdn_git/internal/model"
 	"github.com/nebuk89/cdn_git/internal/node"
+	"github.com/nebuk89/cdn_git/internal/workspace"
 )
 
-const AdapterVersion = "git-snapshot-v0"
+const (
+	AdapterVersion = "git-snapshot-v0"
+	maxGitBlobSize = 32 << 20
+)
 
 type SourceEntry struct {
 	Path     string `json:"path"`
@@ -42,24 +45,15 @@ type SourceSnapshot struct {
 	Entries        []SourceEntry `json:"entries"`
 }
 
-type WorkspaceEntry struct {
-	Path     string `json:"path"`
-	Mode     uint32 `json:"mode"`
-	Type     string `json:"type"`
-	ObjectID string `json:"object_id"`
-}
-
-type WorkspaceSnapshot struct {
-	AdapterVersion string           `json:"adapter_version"`
-	Entries        []WorkspaceEntry `json:"entries"`
-}
-
 type Result struct {
-	Roots          model.Roots `json:"roots"`
-	GitCommitOID   string      `json:"git_commit_oid"`
-	GitTreeOID     string      `json:"git_tree_oid"`
-	TrackedFiles   int         `json:"tracked_files"`
-	WorkspaceFiles int         `json:"workspace_files"`
+	Roots                 model.Roots `json:"roots"`
+	GitCommitOID          string      `json:"git_commit_oid"`
+	GitTreeOID            string      `json:"git_tree_oid"`
+	TrackedFiles          int         `json:"tracked_files"`
+	WorkspaceFiles        int         `json:"workspace_files"`
+	WorkspaceChangedFiles int         `json:"workspace_changed_files"`
+	WorkspaceLogicalBytes int64       `json:"workspace_logical_bytes"`
+	WorkspaceChunks       int         `json:"workspace_chunks"`
 }
 
 func SnapshotRepository(
@@ -69,6 +63,26 @@ func SnapshotRepository(
 	provenance []byte,
 	privateSource bool,
 	privateWorkspace bool,
+) (Result, error) {
+	return SnapshotRepositoryWithWorkspaceParent(
+		current,
+		repository,
+		ref,
+		provenance,
+		privateSource,
+		privateWorkspace,
+		"",
+	)
+}
+
+func SnapshotRepositoryWithWorkspaceParent(
+	current *node.Node,
+	repository string,
+	ref string,
+	provenance []byte,
+	privateSource bool,
+	privateWorkspace bool,
+	workspaceParent string,
 ) (Result, error) {
 	absoluteRepository, err := canonicalDirectory(repository)
 	if err != nil {
@@ -135,24 +149,10 @@ func SnapshotRepository(
 		return Result{}, err
 	}
 
-	workspaceEntries, workspaceLinks, err := importWorkspace(current, absoluteRepository, privateWorkspace)
-	if err != nil {
-		return Result{}, err
-	}
-	workspacePayload, err := canonical.Marshal(WorkspaceSnapshot{
-		AdapterVersion: AdapterVersion,
-		Entries:        workspaceEntries,
-	})
-	if err != nil {
-		return Result{}, err
-	}
-	workspaceRoot, err := current.PutObject(
-		model.NewGraphObject(
-			model.KindWorkspace,
-			"application/vnd.fabric.workspace-snapshot+json",
-			workspacePayload,
-			workspaceLinks,
-		),
+	workspaceResult, err := workspace.Capture(
+		current,
+		absoluteRepository,
+		workspaceParent,
 		privateWorkspace,
 	)
 	if err != nil {
@@ -174,13 +174,16 @@ func SnapshotRepository(
 	return Result{
 		Roots: model.Roots{
 			Source:     sourceRoot,
-			Workspace:  workspaceRoot,
+			Workspace:  workspaceResult.Root,
 			Provenance: provenanceRoot,
 		},
-		GitCommitOID:   commitOID,
-		GitTreeOID:     treeOID,
-		TrackedFiles:   len(entries),
-		WorkspaceFiles: len(workspaceEntries),
+		GitCommitOID:          commitOID,
+		GitTreeOID:            treeOID,
+		TrackedFiles:          len(entries),
+		WorkspaceFiles:        workspaceResult.Files,
+		WorkspaceChangedFiles: workspaceResult.ChangedFiles,
+		WorkspaceLogicalBytes: workspaceResult.LogicalBytes,
+		WorkspaceChunks:       workspaceResult.Chunks,
 	}, nil
 }
 
@@ -281,6 +284,22 @@ func importTrackedFiles(current *node.Node, repository, commitOID string, privat
 		if !utf8.Valid(pathBytes) {
 			return nil, nil, errors.New("v0 Git adapter does not support non-UTF-8 paths")
 		}
+		sizeOutput, err := gitBytes(repository, "cat-file", "-s", fields[2])
+		if err != nil {
+			return nil, nil, err
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(string(sizeOutput)), 10, 64)
+		if err != nil || size < 0 {
+			return nil, nil, fmt.Errorf("invalid Git blob size for %q", string(pathBytes))
+		}
+		if size > maxGitBlobSize {
+			return nil, nil, fmt.Errorf(
+				"Git blob %q is %d bytes; v0.1 supports at most %d bytes per tracked blob",
+				string(pathBytes),
+				size,
+				maxGitBlobSize,
+			)
+		}
 		content, err := gitBytes(repository, "cat-file", "blob", fields[2])
 		if err != nil {
 			return nil, nil, err
@@ -300,90 +319,6 @@ func importTrackedFiles(current *node.Node, repository, commitOID string, privat
 			FabricID: fabricID,
 		})
 		links = append(links, fabricID)
-	}
-	sort.Slice(entries, func(left, right int) bool {
-		return entries[left].Path < entries[right].Path
-	})
-	sort.Strings(links)
-	return entries, unique(links), nil
-}
-
-func importWorkspace(current *node.Node, repository string, private bool) ([]WorkspaceEntry, []string, error) {
-	var entries []WorkspaceEntry
-	var links []string
-	dataRoot, err := canonicalDirectory(current.Root())
-	if err != nil {
-		return nil, nil, err
-	}
-	if filepath.Clean(dataRoot) == filepath.Clean(repository) {
-		return nil, nil, errors.New("fabric node data directory cannot be the workspace root")
-	}
-	err = filepath.WalkDir(repository, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		relative, err := filepath.Rel(repository, path)
-		if err != nil {
-			return err
-		}
-		if relative == "." {
-			return nil
-		}
-		if !utf8.ValidString(relative) {
-			return errors.New("v0 workspace adapter does not support non-UTF-8 paths")
-		}
-		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == ".fabric" || filepath.Clean(path) == filepath.Clean(dataRoot) {
-				return filepath.SkipDir
-			}
-			fabricData, err := isFabricDataRoot(path)
-			if err != nil {
-				return err
-			}
-			if fabricData {
-				return filepath.SkipDir
-			}
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		var payload []byte
-		entryType := "file"
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			entryType = "symlink"
-			target, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			payload = []byte(target)
-		case info.Mode().IsRegular():
-			payload, err = os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-		default:
-			return nil
-		}
-		objectID, err := current.PutObject(
-			model.NewGraphObject(model.KindWorkspace, "application/octet-stream", payload, nil),
-			private,
-		)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, WorkspaceEntry{
-			Path:     filepath.ToSlash(relative),
-			Mode:     uint32(info.Mode().Perm()),
-			Type:     entryType,
-			ObjectID: objectID,
-		})
-		links = append(links, objectID)
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
 	}
 	sort.Slice(entries, func(left, right int) bool {
 		return entries[left].Path < entries[right].Path

@@ -22,6 +22,7 @@ import (
 	"github.com/nebuk89/cdn_git/internal/node"
 	"github.com/nebuk89/cdn_git/internal/security"
 	"github.com/nebuk89/cdn_git/internal/transport"
+	"github.com/nebuk89/cdn_git/internal/workspace"
 )
 
 const version = "0.1.0"
@@ -56,16 +57,30 @@ func run(arguments []string) error {
 		return runGitSnapshot(arguments[1:])
 	case "export-source":
 		return runExportSource(arguments[1:])
+	case "workspace-capture":
+		return runWorkspaceCapture(arguments[1:])
+	case "workspace-fork":
+		return runWorkspaceFork(arguments[1:])
+	case "export-workspace":
+		return runExportWorkspace(arguments[1:])
 	case "transition":
 		return runTransition(arguments[1:])
 	case "finalize":
 		return runFinalize(arguments[1:])
 	case "sync":
 		return runSync(arguments[1:])
+	case "accept":
+		return runAccept(arguments[1:])
 	case "pull-authority":
 		return runPullAuthority(arguments[1:])
 	case "refs":
 		return runRefs(arguments[1:])
+	case "stats":
+		return runStats(arguments[1:])
+	case "verify":
+		return runVerify(arguments[1:])
+	case "gc":
+		return runGC(arguments[1:])
 	case "serve":
 		return runServe(arguments[1:])
 	case "demo":
@@ -234,6 +249,7 @@ func runGitSnapshot(arguments []string) error {
 	provenancePath := flags.String("provenance", "-", "provenance JSON/text file or - for stdin")
 	privateSource := flags.Bool("private-source", false, "store source graph privately")
 	privateWorkspace := flags.Bool("private-workspace", true, "store workspace and provenance privately")
+	workspaceParent := flags.String("workspace-parent", "", "optional parent Workspace Graph root")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -245,18 +261,80 @@ func runGitSnapshot(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	result, err := gitadapter.SnapshotRepository(
+	result, err := gitadapter.SnapshotRepositoryWithWorkspaceParent(
 		current,
 		*repository,
 		*ref,
 		provenance,
 		*privateSource,
 		*privateWorkspace,
+		*workspaceParent,
 	)
 	if err != nil {
 		return err
 	}
 	return writeJSON(result)
+}
+
+func runWorkspaceCapture(arguments []string) error {
+	flags := flag.NewFlagSet("workspace-capture", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "node data directory")
+	directory := flags.String("dir", ".", "workspace directory")
+	parent := flags.String("parent", "", "optional parent Workspace Graph root")
+	private := flags.Bool("private", true, "store workspace privately")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	result, err := workspace.Capture(current, *directory, *parent, *private)
+	if err != nil {
+		return err
+	}
+	return writeJSON(result)
+}
+
+func runWorkspaceFork(arguments []string) error {
+	flags := flag.NewFlagSet("workspace-fork", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "node data directory")
+	parent := flags.String("parent", "", "parent Workspace Graph root")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if *parent == "" {
+		return errors.New("--parent is required")
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	root, err := workspace.Fork(current, *parent)
+	if err != nil {
+		return err
+	}
+	return writeJSON(struct {
+		Root string `json:"root"`
+	}{Root: root})
+}
+
+func runExportWorkspace(arguments []string) error {
+	flags := flag.NewFlagSet("export-workspace", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "node data directory")
+	root := flags.String("workspace", "", "Workspace Graph root")
+	output := flags.String("out", "", "destination directory")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if *root == "" || *output == "" {
+		return errors.New("--workspace and --out are required")
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	return workspace.Materialize(current, *root, *output)
 }
 
 func runExportSource(arguments []string) error {
@@ -347,6 +425,7 @@ func runSync(arguments []string) error {
 	data := flags.String("data", ".fabric", "source node data directory")
 	peer := flags.String("peer", "", "peer base URL")
 	transitionID := flags.String("transition", "", "transition ID")
+	ca := flags.String("ca", "", "optional PEM CA certificate for the peer")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -357,14 +436,56 @@ func runSync(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	client := transport.NewClient(current.Domain().PeerToken)
+	client, err := peerClient(current.Domain().PeerToken, *ca)
+	if err != nil {
+		return err
+	}
 	return client.SyncTransition(context.Background(), current, strings.TrimRight(*peer, "/"), *transitionID)
+}
+
+func runAccept(arguments []string) error {
+	flags := flag.NewFlagSet("accept", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "actor node data directory")
+	peer := flags.String("peer", "", "accepting edge base URL")
+	transitionID := flags.String("transition", "", "transition ID")
+	capabilityPath := flags.String("capability", "", "accepting edge receipt.issue capability file")
+	ca := flags.String("ca", "", "optional PEM CA certificate for the peer")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if *peer == "" || *transitionID == "" || *capabilityPath == "" {
+		return errors.New("--peer, --transition, and --capability are required")
+	}
+	var capability model.Capability
+	if err := security.Load(*capabilityPath, &capability); err != nil {
+		return err
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	client, err := peerClient(current.Domain().PeerToken, *ca)
+	if err != nil {
+		return err
+	}
+	receipt, err := client.AcceptTransition(
+		context.Background(),
+		current,
+		strings.TrimRight(*peer, "/"),
+		*transitionID,
+		capability,
+	)
+	if err != nil {
+		return err
+	}
+	return writeJSON(receipt)
 }
 
 func runPullAuthority(arguments []string) error {
 	flags := flag.NewFlagSet("pull-authority", flag.ContinueOnError)
 	data := flags.String("data", ".fabric", "edge node data directory")
 	peer := flags.String("peer", "", "authority base URL")
+	ca := flags.String("ca", "", "optional PEM CA certificate for the peer")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -375,7 +496,10 @@ func runPullAuthority(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	client := transport.NewClient(current.Domain().PeerToken)
+	client, err := peerClient(current.Domain().PeerToken, *ca)
+	if err != nil {
+		return err
+	}
 	return client.PullAuthority(context.Background(), current, strings.TrimRight(*peer, "/"))
 }
 
@@ -399,10 +523,78 @@ func runRefs(arguments []string) error {
 	}{Refs: refs, Divergent: divergent})
 }
 
+func runStats(arguments []string) error {
+	flags := flag.NewFlagSet("stats", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "node data directory")
+	peer := flags.String("peer", "", "optional peer base URL")
+	ca := flags.String("ca", "", "optional PEM CA certificate for the peer")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	if *peer == "" {
+		stats, err := current.OperationalStats()
+		if err != nil {
+			return err
+		}
+		return writeJSON(stats)
+	}
+	client, err := peerClient(current.Domain().PeerToken, *ca)
+	if err != nil {
+		return err
+	}
+	stats, err := client.PeerStats(context.Background(), strings.TrimRight(*peer, "/"))
+	if err != nil {
+		return err
+	}
+	return writeJSON(stats)
+}
+
+func runVerify(arguments []string) error {
+	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "node data directory")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	report, err := current.Audit()
+	if err != nil {
+		return err
+	}
+	return writeJSON(report)
+}
+
+func runGC(arguments []string) error {
+	flags := flag.NewFlagSet("gc", flag.ContinueOnError)
+	data := flags.String("data", ".fabric", "node data directory")
+	grace := flags.Duration("grace", 24*time.Hour, "minimum age for unreachable objects")
+	apply := flags.Bool("apply", false, "delete candidates; default is dry-run")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	current, err := node.Open(*data)
+	if err != nil {
+		return err
+	}
+	report, err := current.GarbageCollect(*grace, !*apply)
+	if err != nil {
+		return err
+	}
+	return writeJSON(report)
+}
+
 func runServe(arguments []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	data := flags.String("data", ".fabric", "node data directory")
 	listen := flags.String("listen", "127.0.0.1:7337", "HTTP listen address")
+	tlsCertificate := flags.String("tls-cert", "", "PEM TLS certificate")
+	tlsKey := flags.String("tls-key", "", "PEM TLS private key")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -414,6 +606,10 @@ func runServe(arguments []string) error {
 		Addr:              *listen,
 		Handler:           transport.NewServer(current).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -423,8 +619,19 @@ func runServe(arguments []string) error {
 		defer cancel()
 		_ = server.Shutdown(shutdownContext)
 	}()
-	fmt.Printf("fabric %s listening on http://%s as %s\n", version, *listen, current.NodeID())
-	err = server.ListenAndServe()
+	if (*tlsCertificate == "") != (*tlsKey == "") {
+		return errors.New("--tls-cert and --tls-key must be provided together")
+	}
+	scheme := "http"
+	if *tlsCertificate != "" {
+		scheme = "https"
+	}
+	fmt.Printf("fabric %s listening on %s://%s as %s\n", version, scheme, *listen, current.NodeID())
+	if *tlsCertificate != "" {
+		err = server.ListenAndServeTLS(*tlsCertificate, *tlsKey)
+	} else {
+		err = server.ListenAndServe()
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -479,6 +686,13 @@ func splitCSV(value string) []string {
 	return result
 }
 
+func peerClient(peerToken, caPath string) (*transport.Client, error) {
+	if caPath == "" {
+		return transport.NewClient(peerToken), nil
+	}
+	return transport.NewClientWithCA(peerToken, caPath)
+}
+
 func writeJSON(value any) error {
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
@@ -496,11 +710,18 @@ Usage:
   fabric put                store a graph object
   fabric git-snapshot       project Git source and complete workspace state
   fabric export-source      materialize tracked files from a Source Graph root
+  fabric workspace-capture  capture a layered, chunked workspace
+  fabric workspace-fork     create a constant-time metadata workspace fork
+  fabric export-workspace   materialize a Workspace Graph root
   fabric transition         durably accept an authorized state transition
+  fabric accept             obtain independent durability from an edge
   fabric finalize           finalize or preserve a divergent ref
   fabric sync               replicate a transition closure to a peer
   fabric pull-authority     mirror authority journal state
   fabric refs               display shared and divergent refs
+  fabric stats              display local or remote operational counters
+  fabric verify             verify stored objects, transitions, and receipts
+  fabric gc                 report or delete unreachable aged objects
   fabric serve              run the peer HTTP daemon
   fabric demo               run the three-node end-to-end proof
   fabric version            print the version`)

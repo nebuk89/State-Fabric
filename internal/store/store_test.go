@@ -15,6 +15,7 @@ func TestPublicAndPrivateObjectIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	first, err := Open(t.TempDir(), domain)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +80,34 @@ func TestPublicAndPrivateObjectIdentity(t *testing.T) {
 	}
 	if !bytes.Equal(got.Payload, object.Payload) {
 		t.Fatalf("private payload mismatch: %q", got.Payload)
+	}
+}
+
+func TestPutRejectsObjectTooLargeForReplicationEnvelope(t *testing.T) {
+	domain, err := security.NewAuthorityDomain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := Open(t.TempDir(), domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadSize := (model.MaxGraphObjectSize * 3 / 4) + 1024
+	object := model.NewGraphObject(
+		model.KindSource,
+		"application/octet-stream",
+		bytes.Repeat([]byte{'x'}, payloadSize),
+		nil,
+	)
+	if _, err := current.Put(object, false); err == nil {
+		t.Fatal("store accepted an object too large for the replication transport")
+	}
+	stats, err := current.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PublicObjects != 0 || stats.PrivateObjects != 0 {
+		t.Fatal("oversized object persisted despite rejection")
 	}
 }
 

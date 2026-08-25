@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/nebuk89/cdn_git/internal/canonical"
 	"github.com/nebuk89/cdn_git/internal/model"
@@ -32,6 +33,19 @@ type Store struct {
 	domainID      string
 	identityKey   []byte
 	encryptionKey []byte
+}
+
+type ObjectInfo struct {
+	ID       string    `json:"id"`
+	Size     int64     `json:"size"`
+	Modified time.Time `json:"modified"`
+	Private  bool      `json:"private"`
+}
+
+type Stats struct {
+	PublicObjects  int   `json:"public_objects"`
+	PrivateObjects int   `json:"private_objects"`
+	StoredBytes    int64 `json:"stored_bytes"`
 }
 
 func Open(root string, domain security.DomainConfig) (*Store, error) {
@@ -56,14 +70,10 @@ func Open(root string, domain security.DomainConfig) (*Store, error) {
 }
 
 func (store *Store) Put(object model.GraphObject, private bool) (string, error) {
-	if err := object.Validate(); err != nil {
-		return "", err
-	}
-	plaintext, err := canonical.Marshal(object)
+	plaintext, id, err := store.prepare(object, private)
 	if err != nil {
 		return "", err
 	}
-	id := store.objectID(plaintext, private)
 	path, err := store.pathForID(id)
 	if err != nil {
 		return "", err
@@ -88,6 +98,30 @@ func (store *Store) Put(object model.GraphObject, private bool) (string, error) 
 		return "", err
 	}
 	return id, nil
+}
+
+func (store *Store) ExpectedID(object model.GraphObject, private bool) (string, error) {
+	_, id, err := store.prepare(object, private)
+	return id, err
+}
+
+func (store *Store) prepare(object model.GraphObject, private bool) ([]byte, string, error) {
+	if err := object.Validate(); err != nil {
+		return nil, "", err
+	}
+	plaintext, err := canonical.Marshal(object)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(plaintext) > model.MaxGraphObjectSize {
+		return nil, "", fmt.Errorf(
+			"graph object canonical envelope is %d bytes; maximum is %d bytes",
+			len(plaintext),
+			model.MaxGraphObjectSize,
+		)
+	}
+	id := store.objectID(plaintext, private)
+	return plaintext, id, nil
 }
 
 func (store *Store) Get(id string) (model.GraphObject, error) {
@@ -159,6 +193,74 @@ func (store *Store) IsPrivate(id string) bool {
 	return strings.HasPrefix(id, "priv:")
 }
 
+func (store *Store) Objects() ([]ObjectInfo, error) {
+	var result []ObjectInfo
+	root := filepath.Join(store.root, "objects")
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".obj") {
+			return nil
+		}
+		id, err := store.idForPath(path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		result = append(result, ObjectInfo{
+			ID:       id,
+			Size:     info.Size(),
+			Modified: info.ModTime().UTC(),
+			Private:  strings.HasPrefix(id, "priv:"),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(left, right int) bool {
+		return result[left].ID < result[right].ID
+	})
+	return result, nil
+}
+
+func (store *Store) Stats() (Stats, error) {
+	objects, err := store.Objects()
+	if err != nil {
+		return Stats{}, err
+	}
+	var result Stats
+	for _, object := range objects {
+		if object.Private {
+			result.PrivateObjects++
+		} else {
+			result.PublicObjects++
+		}
+		result.StoredBytes += object.Size
+	}
+	return result, nil
+}
+
+func (store *Store) Delete(id string) error {
+	path, err := store.pathForID(id)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
 func (store *Store) objectID(plaintext []byte, private bool) string {
 	digest := sha256.Sum256(plaintext)
 	if !private {
@@ -193,6 +295,24 @@ func (store *Store) pathForID(id string) (string, error) {
 		return filepath.Join(store.root, "objects", category, digest[:2], digest[2:]+".obj"), nil
 	}
 	return filepath.Join(store.root, "objects", category, domain, version, digest[:2], digest[2:]+".obj"), nil
+}
+
+func (store *Store) idForPath(path string) (string, error) {
+	relative, err := filepath.Rel(filepath.Join(store.root, "objects"), path)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	switch {
+	case len(parts) == 3 && parts[0] == "public":
+		digest := parts[1] + strings.TrimSuffix(parts[2], ".obj")
+		return "obj:sha256:" + digest, nil
+	case len(parts) == 5 && parts[0] == "private":
+		digest := parts[3] + strings.TrimSuffix(parts[4], ".obj")
+		return "priv:" + parts[1] + ":" + parts[2] + ":" + digest, nil
+	default:
+		return "", fmt.Errorf("unexpected object path %q", relative)
+	}
 }
 
 func (store *Store) encrypt(plaintext []byte) ([]byte, error) {

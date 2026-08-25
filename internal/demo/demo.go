@@ -1,7 +1,9 @@
 package demo
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 	"github.com/nebuk89/cdn_git/internal/model"
 	"github.com/nebuk89/cdn_git/internal/node"
 	"github.com/nebuk89/cdn_git/internal/transport"
+	"github.com/nebuk89/cdn_git/internal/workspace"
 )
 
 type Result struct {
@@ -36,7 +39,7 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return Result{}, err
 	}
-	fmt.Fprintf(output, "State Fabric v0 three-node demo\n")
+	fmt.Fprintf(output, "State Fabric v0.1 beta proof\n")
 	fmt.Fprintf(output, "data: %s\n\n", directory)
 
 	authority, err := node.Initialize(filepath.Join(directory, "authority"), true, nil)
@@ -61,6 +64,10 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 		return Result{}, err
 	}
 	capB, err := authority.IssueCapability(edgeB.PublicKey(), "demo", []string{"transition.accept"}, time.Hour)
+	if err != nil {
+		return Result{}, err
+	}
+	capBReceipt, err := authority.IssueCapability(edgeB.PublicKey(), "demo", []string{"receipt.issue"}, time.Hour)
 	if err != nil {
 		return Result{}, err
 	}
@@ -108,9 +115,42 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 	edgeBServer.Close()
 	fmt.Fprintf(output, "1. Authority finalized base state\n   %s\n\n", base.ID)
 
+	workspaceDirectory := filepath.Join(directory, "agent-workspace")
+	if err := os.MkdirAll(workspaceDirectory, 0o700); err != nil {
+		return Result{}, err
+	}
+	workspacePayload := bytes.Repeat([]byte("warm-agent-state\n"), 100000)
+	if err := os.WriteFile(filepath.Join(workspaceDirectory, "state.bin"), workspacePayload, 0o600); err != nil {
+		return Result{}, err
+	}
+	captured, err := workspace.Capture(edgeA, workspaceDirectory, "", true)
+	if err != nil {
+		return Result{}, err
+	}
+	forkedWorkspace, err := workspace.Fork(edgeA, captured.Root)
+	if err != nil {
+		return Result{}, err
+	}
+	materialized := filepath.Join(directory, "fork-materialized")
+	if err := workspace.Materialize(edgeA, forkedWorkspace, materialized); err != nil {
+		return Result{}, err
+	}
+	materializedPayload, err := os.ReadFile(filepath.Join(materialized, "state.bin"))
+	if err != nil {
+		return Result{}, err
+	}
+	if !bytes.Equal(materializedPayload, workspacePayload) {
+		return Result{}, errors.New("metadata workspace fork did not materialize identical state")
+	}
+	fmt.Fprintf(output, "2. Captured a chunked workspace and created a metadata-only fork\n")
+	fmt.Fprintf(output, "   parent: %s\n", captured.Root)
+	fmt.Fprintf(output, "   fork:   %s\n\n", forkedWorkspace)
+
+	firstRoots := roots(edgeA, "agent-a")
+	firstRoots.Workspace = forkedWorkspace
 	first, receiptA, err := edgeA.CreateTransition(node.TransitionRequest{
 		Namespace:         "demo",
-		Roots:             roots(edgeA, "agent-a"),
+		Roots:             firstRoots,
 		ParentTransitions: []string{base.ID},
 		RefName:           "refs/heads/main",
 		Expected:          base.ID,
@@ -130,9 +170,20 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 	if err != nil {
 		return Result{}, err
 	}
-	fmt.Fprintf(output, "2. Authority offline: two edges durably accepted conflicting work\n")
+	edgeBServer = httptest.NewServer(transport.NewServer(edgeB).Handler())
+	independentReceipt, err := client.AcceptTransition(ctx, edgeA, edgeBServer.URL, first.ID, capBReceipt)
+	edgeBServer.Close()
+	if err != nil {
+		return Result{}, err
+	}
+	if independentReceipt.NodePublicKey != edgeB.PublicKey() ||
+		independentReceipt.NodePublicKey == first.Body.ActorPublicKey {
+		return Result{}, errors.New("independent edge receipt was not signed by edge B")
+	}
+	fmt.Fprintf(output, "3. Authority offline: two edges durably accepted conflicting work\n")
 	fmt.Fprintf(output, "   A receipt: %s\n", receiptA.ID)
 	fmt.Fprintf(output, "   B receipt: %s\n\n", receiptB.ID)
+	fmt.Fprintf(output, "   independent receipt for A, signed by B: %s\n\n", independentReceipt.ID)
 
 	edgeA, err = node.Open(edgeA.Root())
 	if err != nil {
@@ -141,11 +192,11 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 	if _, err := edgeA.LoadTransition(first.ID); err != nil {
 		return Result{}, fmt.Errorf("edge A restart lost accepted transition: %w", err)
 	}
-	fmt.Fprintf(output, "3. Edge A restarted; its acknowledged transition survived\n\n")
+	fmt.Fprintf(output, "4. Edge A restarted; its acknowledged transition survived\n\n")
 
 	authorityServer := httptest.NewServer(transport.NewServer(authority).Handler())
 	defer authorityServer.Close()
-	if err := client.SyncTransition(ctx, edgeA, authorityServer.URL, first.ID); err != nil {
+	if err := client.SyncTransition(ctx, edgeB, authorityServer.URL, first.ID); err != nil {
 		return Result{}, err
 	}
 	if err := client.SyncTransition(ctx, edgeB, authorityServer.URL, second.ID); err != nil {
@@ -162,7 +213,7 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 	if firstResult.Status != "finalized" || secondResult.Status != "divergent" {
 		return Result{}, fmt.Errorf("unexpected conflict outcomes: %s and %s", firstResult.Status, secondResult.Status)
 	}
-	fmt.Fprintf(output, "4. Connectivity restored; authority preserved both histories\n")
+	fmt.Fprintf(output, "5. Connectivity restored; authority preserved both histories\n")
 	fmt.Fprintf(output, "   shared:    %s\n", first.ID)
 	fmt.Fprintf(output, "   divergent: %s -> %s\n\n", secondResult.DivergentRef, second.ID)
 
@@ -221,9 +272,12 @@ func Run(ctx context.Context, directory string, output io.Writer) (Result, error
 	if divergentA[secondResult.DivergentRef] != second.ID || divergentB[secondResult.DivergentRef] != second.ID {
 		return Result{}, fmt.Errorf("divergent history disappeared after merge")
 	}
-	fmt.Fprintf(output, "5. Merge transition references both parents; all nodes converged\n")
+	fmt.Fprintf(output, "6. Merge transition references both parents; all nodes converged\n")
 	fmt.Fprintf(output, "   final: %s\n\n", merge.ID)
-	fmt.Fprintf(output, "PASS: nearby durability, restart recovery, replication, conflict preservation, and convergence are real.\n")
+	if _, err := authority.Audit(); err != nil {
+		return Result{}, fmt.Errorf("authority audit: %w", err)
+	}
+	fmt.Fprintf(output, "PASS: layered workspace forks, independent edge durability, restart recovery, replication, conflict preservation, audit, and convergence are real.\n")
 
 	return Result{
 		Directory:        directory,
