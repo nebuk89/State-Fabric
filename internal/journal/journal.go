@@ -123,16 +123,8 @@ func (log *Log) Reload() error {
 func (log *Log) Import(records []model.JournalRecord) error {
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	if err := verifyRecords(records, log.signerPublic); err != nil {
+	if err := validateImport(log.records, records, log.signerPublic); err != nil {
 		return err
-	}
-	if len(records) < len(log.records) {
-		return errors.New("imported journal is behind local journal")
-	}
-	for index := range log.records {
-		if subtle.ConstantTimeCompare([]byte(log.records[index].ID), []byte(records[index].ID)) != 1 {
-			return errors.New("journal history fork detected")
-		}
 	}
 	if len(records) == len(log.records) {
 		return nil
@@ -144,6 +136,27 @@ func (log *Log) Import(records []model.JournalRecord) error {
 		return err
 	}
 	log.records = append([]model.JournalRecord(nil), records...)
+	return nil
+}
+
+func (log *Log) ValidateImport(records []model.JournalRecord) error {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return validateImport(log.records, records, log.signerPublic)
+}
+
+func validateImport(current, incoming []model.JournalRecord, signerPublic string) error {
+	if err := verifyRecords(incoming, signerPublic); err != nil {
+		return err
+	}
+	if len(incoming) < len(current) {
+		return errors.New("imported journal is behind local journal")
+	}
+	for index := range current {
+		if subtle.ConstantTimeCompare([]byte(current[index].ID), []byte(incoming[index].ID)) != 1 {
+			return errors.New("journal history fork detected")
+		}
+	}
 	return nil
 }
 

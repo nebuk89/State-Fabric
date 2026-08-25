@@ -2,9 +2,9 @@
 
 ## The bet
 
-State Fabric should not win by being a marginally faster Git remote. It should
-win by making the **complete agent workspace** a portable, forkable,
-content-addressed object.
+State Fabric should not win by replacing Git. It should make the **complete agent
+workspace** a portable, forkable, content-addressed object while agents continue
+to use ordinary Git commands.
 
 The narrow product promise is:
 
@@ -13,9 +13,37 @@ The narrow product promise is:
 > continue through partitions, and never silently lose a divergent result.
 
 The first user is a coding-agent platform team running many tasks per repository.
-That team controls its runtime, has repeated state, pays origin and startup costs,
-and can integrate a native client without waiting for Git UX to represent
-asynchronous finality.
+That team controls its runtime, has repeated state, and pays origin and startup
+costs. Its agents should use `git clone`, `git fetch`, and `git push` against
+`fabric://` origins while the platform adopts additional State Fabric semantics
+deliberately.
+
+## Git integration decision
+
+- Use Git's supported remote-helper extension through `git-remote-fabric`.
+- Do not vendor or fork the Git binary.
+- Do not make Git hooks a correctness boundary; hooks may become optional
+  convenience automation.
+- Keep clone, fetch, and push in the normal Git CLI.
+- Keep `git-fabric` narrow: `git fabric checkpoint` and `git fabric status`
+  cover State Fabric semantics with no faithful Git equivalent.
+
+The local node/cache, accepting edge receipt, and Authority Journal form the
+durability path behind the helper.
+
+## Positioning
+
+State Fabric is not a claim that GitHub should be replaced: Git and GitHub remain
+the stronger default for ecosystem interoperability, human collaboration,
+governance, and operational maturity. Cursor's
+[Git at any scale](https://cursor.com/blog/git-at-any-scale) describes a different
+strength: centralized Git serving at scale using normal Git repositories as warm
+NVMe caches over an authoritative object-store write-ahead log.
+
+State Fabric is exploring the layer those systems do not target directly:
+near-agent complete workspace state, signed offline edge receipts, explicit
+divergence preservation, and agent provenance. Its performance and production
+economics remain unproven.
 
 ## What exists
 
@@ -52,6 +80,11 @@ cost.
 | Delegated `receipt.issue` capability | Implemented and tested |
 | TLS server and explicit client CA | Implemented and tested |
 | Audit, stats, and offline reachability GC | Implemented and tested |
+| Git source bundle capture/import primitives | Implemented and tested |
+| Local SHA-1 `git-remote-fabric` clone/fetch/push | Implemented and process-tested |
+| Peer-backed cache hydration for Git clone/fetch/push | Implemented and process-tested over HTTP |
+| `git-fabric` checkpoint/status commands | Implemented and process-tested |
+| Direct host-addressed discovery and SHA-256 remote-helper support | Not started |
 | Live demand hydration and read-byte telemetry | Not started |
 | Multi-host fault campaign | Not started |
 | Durability-class evidence beyond host-disk | Not started |
@@ -81,6 +114,8 @@ Each phase must earn the right to fund the next one.
 - Record origin bytes, workspace bytes, cache reuse, task density, and cost.
 - Benchmark against cold clone/install, Git partial clone, and the partner's
   existing warm-cache approach.
+- Specify and test the `git-remote-fabric` ref/object mapping without modifying
+  Git or relying on hooks.
 - Make and record the G0 decision.
 - Integrate the metrics into a repeatable benchmark harness in this repository.
 
@@ -148,6 +183,16 @@ Priority is ordered by user value and risk reduction, not by protocol layer.
 | WSP-06 | Add hydration telemetry | Reports logical bytes, fetched bytes, cache level, misses, and time-to-first-test |
 | WSP-07 | Run G1 benchmark | At least 50% lower p95 time-to-first-test than the best honest baseline |
 
+### P1 - Preserve ordinary Git workflows
+
+| ID | Backlog item | Acceptance criteria |
+|---|---|---|
+| GIT-01 | Implement `git-remote-fabric` clone | `git clone fabric://...` produces a valid checkout through Git's remote-helper protocol |
+| GIT-02 | Implement fetch and push | Unmodified `git fetch` and `git push` exchange refs and objects with deterministic conflict preservation |
+| GIT-03 | Bind pushes to State Fabric transitions | Source, Workspace, and Provenance roots reach an accepting edge receipt and Authority Journal without a required hook |
+| GIT-04 | Add compatibility coverage | SHA-1 and SHA-256 repositories pass clone/fetch/push process tests with supported Git versions |
+| GIT-05 | Define narrow State Fabric commands | Only semantics Git cannot express are considered for `git fabric checkpoint/status` |
+
 ### P1 - Prove real topology
 
 | ID | Backlog item | Acceptance criteria |
@@ -197,11 +242,16 @@ Priority is ordered by user value and risk reduction, not by protocol layer.
 | INT-03 | Add rollout controls | Shadow mode, fallback, per-repository enablement, and no-loss rollback path |
 | INT-04 | Run G5 economics review | Cost per 1,000 tasks and saved wall-clock/egress support continued investment |
 
+## Out of scope by design
+
+- vendoring or forking the Git binary;
+- requiring Git hooks for correctness;
+- replacing normal clone, fetch, or push with proprietary agent commands.
+
 ## Explicitly deferred
 
 Do not spend roadmap capacity on these until G0-G4 pass:
 
-- full Git smart-protocol server;
 - Git LFS and submodule breadth;
 - multi-authority consensus;
 - regional placement prediction;
@@ -216,18 +266,19 @@ Do not spend roadmap capacity on these until G0-G4 pass:
 
 - leading with the protocol instead of a fleet operator's task latency and cost;
 - presenting a functional public beta as proof of real-fleet performance;
-- expanding generic Git compatibility before the native agent workflow works.
+- hiding State Fabric-only semantics inside surprising Git behavior.
 
 **Continue**
 
 - durability and no-silent-loss invariants;
 - falsifiable hypotheses and explicit kill criteria;
-- one-binary OSS reproducibility;
+- OSS reproducibility with standard Git extension points;
 - provider independence as strategic leverage, not headline value.
 
 **Start**
 
 - measuring a real fleet before adding protocol surface;
+- completing and validating the `git-remote-fabric` path;
 - building the layered, forkable workspace graph;
 - testing multi-host behavior and independent-edge receipts;
 - quantifying reconciliation burden and unit economics.

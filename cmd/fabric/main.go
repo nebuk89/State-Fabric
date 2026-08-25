@@ -28,8 +28,18 @@ import (
 const version = "0.1.0"
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "fabric:", err)
+	name := filepath.Base(os.Args[0])
+	var err error
+	switch name {
+	case "git-remote-fabric":
+		err = runGitRemote(os.Args[1:], os.Stdin, os.Stdout)
+	case "git-fabric":
+		err = runGitFabric(os.Args[1:])
+	default:
+		err = run(os.Args[1:])
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
 		os.Exit(1)
 	}
 }

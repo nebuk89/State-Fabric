@@ -44,8 +44,45 @@ func TestSnapshotAndExportTrackedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runGit(t, repository, "update-ref", "refs/fabric/bundle", "HEAD")
+	repeated, err := SnapshotRepository(current, repository, "HEAD", []byte(`{"agent":"test"}`), false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSnapshot, err := LoadSourceSnapshot(current, result.Roots.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeatedSnapshot, err := LoadSourceSnapshot(current, repeated.Roots.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeatedSnapshot.BundleID != firstSnapshot.BundleID || repeated.Roots.Source != result.Roots.Source {
+		t.Fatalf(
+			"unchanged Git state did not deduplicate: first bundle/source=%s/%s repeated=%s/%s",
+			firstSnapshot.BundleID,
+			result.Roots.Source,
+			repeatedSnapshot.BundleID,
+			repeated.Roots.Source,
+		)
+	}
+	bundleRefs := exec.Command("git", "-C", repository, "for-each-ref", "--format=%(refname)", "refs/fabric")
+	if output, err := bundleRefs.CombinedOutput(); err != nil {
+		t.Fatalf("inspect temporary bundle refs: %v\n%s", err, output)
+	} else if len(bytes.TrimSpace(output)) != 0 {
+		t.Fatalf("snapshot left temporary bundle refs behind: %s", output)
+	}
 	if result.TrackedFiles != 3 || result.WorkspaceFiles != 4 {
 		t.Fatalf("unexpected file counts: tracked=%d workspace=%d", result.TrackedFiles, result.WorkspaceFiles)
+	}
+	bare := filepath.Join(t.TempDir(), "clone.git")
+	runGit(t, "", "init", "--bare", "-q", bare)
+	if err := ImportGitBundle(current, result.Roots.Source, bare); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "--git-dir", bare, "cat-file", "-e", result.GitCommitOID+"^{commit}")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("verify imported bundle: %v\n%s", err, output)
 	}
 
 	exported := filepath.Join(t.TempDir(), "exported")

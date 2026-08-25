@@ -306,6 +306,103 @@ func (client *Client) SyncTransition(ctx context.Context, local *node.Node, peer
 	return client.syncTransition(ctx, local, peerURL, transitionID, true, make(map[string]struct{}))
 }
 
+func (client *Client) PullTransition(ctx context.Context, local *node.Node, peerURL, transitionID string) error {
+	return client.pullTransition(ctx, local, peerURL, transitionID, make(map[string]struct{}))
+}
+
+func (client *Client) pullTransition(
+	ctx context.Context,
+	local *node.Node,
+	peerURL string,
+	transitionID string,
+	visited map[string]struct{},
+) error {
+	if _, ok := visited[transitionID]; ok {
+		return nil
+	}
+	visited[transitionID] = struct{}{}
+	if _, err := local.LoadTransition(transitionID); err == nil {
+		return nil
+	}
+	var envelope transitionEnvelope
+	if err := client.get(
+		ctx,
+		peerURL+"/v0/transitions/"+url.PathEscape(transitionID),
+		&envelope,
+	); err != nil {
+		return fmt.Errorf("fetch transition %s: %w", transitionID, err)
+	}
+	if envelope.Transition.ID != transitionID {
+		return errors.New("peer returned a different transition ID")
+	}
+	for _, parentID := range envelope.Transition.Body.ParentTransitions {
+		if err := client.pullTransition(ctx, local, peerURL, parentID, visited); err != nil {
+			return fmt.Errorf("fetch parent %s: %w", parentID, err)
+		}
+	}
+	if err := client.pullObject(
+		ctx,
+		local,
+		peerURL,
+		envelope.Transition.Body.RequiredObjectManifest,
+		make(map[string]struct{}),
+	); err != nil {
+		return err
+	}
+	if err := local.IngestTransition(envelope.Transition, envelope.Receipt); err != nil {
+		return fmt.Errorf("ingest transition %s: %w", transitionID, err)
+	}
+	return nil
+}
+
+func (client *Client) pullObject(
+	ctx context.Context,
+	local *node.Node,
+	peerURL string,
+	id string,
+	visited map[string]struct{},
+) error {
+	if _, ok := visited[id]; ok {
+		return nil
+	}
+	visited[id] = struct{}{}
+	if object, err := local.GetObject(id); err == nil {
+		for _, link := range object.Links {
+			if err := client.pullObject(ctx, local, peerURL, link, visited); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var envelope objectEnvelope
+	if err := client.get(ctx, peerURL+"/v0/objects/"+url.PathEscape(id), &envelope); err != nil {
+		return fmt.Errorf("fetch object %s: %w", id, err)
+	}
+	if envelope.ID != id || envelope.Private != strings.HasPrefix(id, "priv:") {
+		return errors.New("peer returned an object envelope with mismatched identity")
+	}
+	expectedID, err := local.ExpectedObjectID(envelope.Object, envelope.Private)
+	if err != nil {
+		return err
+	}
+	if expectedID != id {
+		return errors.New("peer object canonical identity mismatch")
+	}
+	storedID, err := local.PutObject(envelope.Object, envelope.Private)
+	if err != nil {
+		return err
+	}
+	if storedID != id {
+		return errors.New("stored peer object identity mismatch")
+	}
+	for _, link := range envelope.Object.Links {
+		if err := client.pullObject(ctx, local, peerURL, link, visited); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (client *Client) syncTransition(
 	ctx context.Context,
 	local *node.Node,
@@ -425,7 +522,97 @@ func (client *Client) PullAuthority(ctx context.Context, local *node.Node, peerU
 	if err := client.get(ctx, peerURL+"/v0/authority", &response); err != nil {
 		return err
 	}
-	return local.ImportAuthorityRecords(response.Records)
+	currentLength, err := local.ValidateAuthoritySnapshot(response.Records)
+	if err != nil {
+		return fmt.Errorf("validate authority snapshot: %w", err)
+	}
+	if currentLength == len(response.Records) {
+		return nil
+	}
+	transitionIDs := make([]string, 0)
+	seen := make(map[string]struct{})
+	visited := make(map[string]struct{})
+	for _, record := range response.Records[:currentLength] {
+		if record.Body.TransitionID != "" {
+			seen[record.Body.TransitionID] = struct{}{}
+			visited[record.Body.TransitionID] = struct{}{}
+		}
+	}
+	for _, record := range response.Records[currentLength:] {
+		if record.Body.TransitionID == "" {
+			continue
+		}
+		if _, ok := seen[record.Body.TransitionID]; ok {
+			continue
+		}
+		seen[record.Body.TransitionID] = struct{}{}
+		transitionIDs = append(transitionIDs, record.Body.TransitionID)
+	}
+	transitions := make([]node.PeerTransition, 0, len(transitionIDs))
+	for _, transitionID := range transitionIDs {
+		if err := client.fetchPeerTransition(
+			ctx,
+			local,
+			peerURL,
+			transitionID,
+			visited,
+			&transitions,
+		); err != nil {
+			return err
+		}
+	}
+	return local.ImportAuthoritySnapshot(response.Records, transitions)
+}
+
+func (client *Client) fetchPeerTransition(
+	ctx context.Context,
+	local *node.Node,
+	peerURL string,
+	transitionID string,
+	visited map[string]struct{},
+	transitions *[]node.PeerTransition,
+) error {
+	if _, ok := visited[transitionID]; ok {
+		return nil
+	}
+	visited[transitionID] = struct{}{}
+	var envelope transitionEnvelope
+	if err := client.get(
+		ctx,
+		peerURL+"/v0/transitions/"+url.PathEscape(transitionID),
+		&envelope,
+	); err != nil {
+		return fmt.Errorf("fetch transition %s: %w", transitionID, err)
+	}
+	if envelope.Transition.ID != transitionID {
+		return errors.New("peer returned a different transition ID")
+	}
+	for _, parentID := range envelope.Transition.Body.ParentTransitions {
+		if err := client.fetchPeerTransition(
+			ctx,
+			local,
+			peerURL,
+			parentID,
+			visited,
+			transitions,
+		); err != nil {
+			return fmt.Errorf("fetch parent %s: %w", parentID, err)
+		}
+	}
+	if err := client.pullObject(
+		ctx,
+		local,
+		peerURL,
+		envelope.Transition.Body.RequiredObjectManifest,
+		make(map[string]struct{}),
+	); err != nil {
+		return err
+	}
+	*transitions = append(*transitions, node.PeerTransition{
+		Transition: envelope.Transition,
+		Receipt:    envelope.Receipt,
+	})
+	return nil
 }
 
 func (client *Client) PeerRefs(ctx context.Context, peerURL string) (map[string]string, map[string]string, error) {

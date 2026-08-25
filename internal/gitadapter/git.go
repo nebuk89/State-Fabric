@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,14 +18,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/nebuk89/cdn_git/internal/canonical"
+	"github.com/nebuk89/cdn_git/internal/filelock"
 	"github.com/nebuk89/cdn_git/internal/model"
 	"github.com/nebuk89/cdn_git/internal/node"
 	"github.com/nebuk89/cdn_git/internal/workspace"
 )
 
 const (
-	AdapterVersion = "git-snapshot-v0"
-	maxGitBlobSize = 32 << 20
+	AdapterVersion   = "git-snapshot-v0"
+	maxGitBlobSize   = 32 << 20
+	maxGitBundleSize = 32 << 20
 )
 
 type SourceEntry struct {
@@ -43,6 +46,7 @@ type SourceSnapshot struct {
 	Parents        []string      `json:"parents"`
 	CommitObject   []byte        `json:"commit_object"`
 	Entries        []SourceEntry `json:"entries"`
+	BundleID       string        `json:"bundle_id,omitempty"`
 }
 
 type Result struct {
@@ -124,6 +128,20 @@ func SnapshotRepositoryWithWorkspaceParent(
 	if err != nil {
 		return Result{}, err
 	}
+	bundle, err := createGitBundle(absoluteRepository, commitOID)
+	if err != nil {
+		return Result{}, err
+	}
+	bundleID, err := current.PutObject(
+		model.NewGraphObject(model.KindSource, "application/x-git-bundle", bundle, nil),
+		privateSource,
+	)
+	if err != nil {
+		return Result{}, err
+	}
+	sourceLinks = append(sourceLinks, bundleID)
+	sort.Strings(sourceLinks)
+	sourceLinks = unique(sourceLinks)
 	sourcePayload, err := canonical.Marshal(SourceSnapshot{
 		AdapterVersion: AdapterVersion,
 		ObjectFormat:   objectFormat,
@@ -132,6 +150,7 @@ func SnapshotRepositoryWithWorkspaceParent(
 		Parents:        parents,
 		CommitObject:   commitObject,
 		Entries:        entries,
+		BundleID:       bundleID,
 	})
 	if err != nil {
 		return Result{}, err
@@ -188,22 +207,9 @@ func SnapshotRepositoryWithWorkspaceParent(
 }
 
 func ExportTrackedFiles(current *node.Node, sourceRoot, destination string) error {
-	root, err := current.GetObject(sourceRoot)
+	snapshot, err := LoadSourceSnapshot(current, sourceRoot)
 	if err != nil {
 		return err
-	}
-	if root.Kind != model.KindSource || root.MediaType != "application/vnd.fabric.git-source-snapshot+json" {
-		return errors.New("object is not a Git source snapshot")
-	}
-	var snapshot SourceSnapshot
-	if err := canonical.Decode(root.Payload, &snapshot); err != nil {
-		return err
-	}
-	if snapshot.AdapterVersion != AdapterVersion {
-		return errors.New("unsupported Git snapshot adapter version")
-	}
-	if snapshot.ObjectFormat != "sha1" && snapshot.ObjectFormat != "sha256" {
-		return fmt.Errorf("unsupported Git object format %q", snapshot.ObjectFormat)
 	}
 	if _, err := os.Lstat(destination); err == nil {
 		return errors.New("export destination must not already exist")
@@ -257,11 +263,86 @@ func ExportTrackedFiles(current *node.Node, sourceRoot, destination string) erro
 	return nil
 }
 
+func LoadSourceSnapshot(current *node.Node, sourceRoot string) (SourceSnapshot, error) {
+	root, err := current.GetObject(sourceRoot)
+	if err != nil {
+		return SourceSnapshot{}, err
+	}
+	if root.Kind != model.KindSource || root.MediaType != "application/vnd.fabric.git-source-snapshot+json" {
+		return SourceSnapshot{}, errors.New("object is not a Git source snapshot")
+	}
+	var snapshot SourceSnapshot
+	if err := canonical.Decode(root.Payload, &snapshot); err != nil {
+		return SourceSnapshot{}, err
+	}
+	if snapshot.AdapterVersion != AdapterVersion {
+		return SourceSnapshot{}, errors.New("unsupported Git snapshot adapter version")
+	}
+	if snapshot.ObjectFormat != "sha1" && snapshot.ObjectFormat != "sha256" {
+		return SourceSnapshot{}, fmt.Errorf("unsupported Git object format %q", snapshot.ObjectFormat)
+	}
+	expectedLinks := make([]string, 0, len(snapshot.Entries)+1)
+	for _, entry := range snapshot.Entries {
+		expectedLinks = append(expectedLinks, entry.FabricID)
+	}
+	if snapshot.BundleID != "" {
+		expectedLinks = append(expectedLinks, snapshot.BundleID)
+	}
+	sort.Strings(expectedLinks)
+	expectedLinks = unique(expectedLinks)
+	if strings.Join(root.Links, "\x00") != strings.Join(expectedLinks, "\x00") {
+		return SourceSnapshot{}, errors.New("Git source snapshot links do not bind its object inventory")
+	}
+	return snapshot, nil
+}
+
+func ImportGitBundle(current *node.Node, sourceRoot, gitDirectory string) error {
+	snapshot, err := LoadSourceSnapshot(current, sourceRoot)
+	if err != nil {
+		return err
+	}
+	if snapshot.BundleID == "" {
+		return errors.New("Git source snapshot predates remote-helper bundle support")
+	}
+	bundle, err := current.GetObject(snapshot.BundleID)
+	if err != nil {
+		return err
+	}
+	if bundle.Kind != model.KindSource || bundle.MediaType != "application/x-git-bundle" {
+		return errors.New("source snapshot bundle object has the wrong type")
+	}
+	file, err := os.CreateTemp("", "fabric-git-*.bundle")
+	if err != nil {
+		return err
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := file.Write(bundle.Payload); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if _, err := gitBytesWithDirectory(gitDirectory, "bundle", "unbundle", path); err != nil {
+		return err
+	}
+	if _, err := gitBytesWithDirectory(gitDirectory, "cat-file", "-e", snapshot.CommitOID+"^{commit}"); err != nil {
+		return fmt.Errorf("imported bundle does not contain commit %s: %w", snapshot.CommitOID, err)
+	}
+	return nil
+}
+
 func importTrackedFiles(current *node.Node, repository, commitOID string, private bool) ([]SourceEntry, []string, error) {
 	output, err := gitBytes(repository, "ls-tree", "-r", "-z", "--full-tree", commitOID)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	records := bytes.Split(output, []byte{0})
 	entries := make([]SourceEntry, 0, len(records))
 	links := make([]string, 0, len(records))
@@ -327,6 +408,71 @@ func importTrackedFiles(current *node.Node, repository, commitOID string, privat
 	return entries, unique(links), nil
 }
 
+func createGitBundle(repository, commitOID string) ([]byte, error) {
+	commonDirectory, err := gitOutput(repository, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(commonDirectory) {
+		commonDirectory = filepath.Join(repository, commonDirectory)
+	}
+	commonDirectory, err = filepath.Abs(commonDirectory)
+	if err != nil {
+		return nil, err
+	}
+	var bundle []byte
+	err = filelock.With(filepath.Join(commonDirectory, "fabric-bundle.lock"), func() error {
+		var createErr error
+		bundle, createErr = createGitBundleLocked(repository, commitOID)
+		return createErr
+	})
+	return bundle, err
+}
+
+func createGitBundleLocked(repository, commitOID string) (bundle []byte, resultErr error) {
+	const bundleRef = "refs/fabric/bundle"
+	if _, err := gitBytes(repository, "update-ref", bundleRef, commitOID); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if _, err := gitBytes(repository, "update-ref", "-d", bundleRef, commitOID); err != nil && resultErr == nil {
+			resultErr = fmt.Errorf("remove temporary Git bundle ref: %w", err)
+		}
+	}()
+
+	command := exec.Command("git", "-C", repository, "bundle", "create", "-", bundleRef)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	bundle, err = io.ReadAll(io.LimitReader(stdout, maxGitBundleSize+1))
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return nil, err
+	}
+	if len(bundle) > maxGitBundleSize {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return nil, fmt.Errorf(
+			"Git history bundle exceeds the v0.1 limit of %d bytes",
+			maxGitBundleSize,
+		)
+	}
+	if err := command.Wait(); err != nil {
+		return nil, fmt.Errorf(
+			"git bundle create: %s",
+			strings.TrimSpace(stderr.String()),
+		)
+	}
+	return bundle, nil
+}
+
 func canonicalDirectory(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -373,6 +519,16 @@ func gitOutput(repository string, arguments ...string) (string, error) {
 func gitBytes(repository string, arguments ...string) ([]byte, error) {
 	commandArguments := append([]string{"-C", repository}, arguments...)
 	command := exec.Command("git", commandArguments...)
+	return commandOutput(command, arguments)
+}
+
+func gitBytesWithDirectory(gitDirectory string, arguments ...string) ([]byte, error) {
+	commandArguments := append([]string{"--git-dir", gitDirectory}, arguments...)
+	command := exec.Command("git", commandArguments...)
+	return commandOutput(command, arguments)
+}
+
+func commandOutput(command *exec.Cmd, arguments []string) ([]byte, error) {
 	output, err := command.Output()
 	if err != nil {
 		var exitError *exec.ExitError
