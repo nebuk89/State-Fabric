@@ -1,0 +1,4 @@
+.fabric/
+bin/
+*.bundle.json
+capability.json
