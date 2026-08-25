@@ -2,11 +2,8 @@
 
 **Warm, forkable workspace state for coding-agent fleets.**
 
-## The dream demo
-
 https://github.com/user-attachments/assets/b27ae889-14da-48e7-93a9-b91a2d519e7e
 
-**[Download the 45-second hero demo from the v0.1.0 release](https://github.com/nebuk89/State-Fabric/releases/download/v0.1.0/state-fabric-offbox-hero.mp4)**
 
 One Git workflow, two machines, durable state. This real off-box run starts with
 an ordinary `git push` on this host, clones and changes the repository on a
@@ -57,8 +54,6 @@ remote-helper support remain roadmap work.
 
 ## How it differs
 
-[Cursor's Git at any scale](https://cursor.com/blog/git-at-any-scale) describes
-its published architecture; this table does not imply benchmark parity.
 
 | Dimension | Traditional Git / GitHub | Cursor's published Git-at-scale approach | State Fabric direction |
 |---|---|---|---|
