@@ -4,9 +4,9 @@
 
 ## The dream demo
 
-[![State Fabric hero demo: one Git workflow, two machines, durable state](docs/assets/state-fabric-hero-poster.png)](https://github.com/nebuk89/State-Fabric/releases/download/v0.1.0/state-fabric-offbox-hero.mp4)
+https://github.com/user-attachments/assets/b27ae889-14da-48e7-93a9-b91a2d519e7e
 
-**[Watch the 45-second hero demo](https://github.com/nebuk89/State-Fabric/releases/download/v0.1.0/state-fabric-offbox-hero.mp4)**
+**[Download the 45-second hero demo from the v0.1.0 release](https://github.com/nebuk89/State-Fabric/releases/download/v0.1.0/state-fabric-offbox-hero.mp4)**
 
 One Git workflow, two machines, durable state. This real off-box run starts with
 an ordinary `git push` on this host, clones and changes the repository on a
