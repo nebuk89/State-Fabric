@@ -48,6 +48,11 @@ type TransitionRequest struct {
 	PolicyContext     string
 }
 
+type PeerTransition struct {
+	Transition model.Transition
+	Receipt    model.EdgeReceipt
+}
+
 type OperationalStats struct {
 	NodeID           string      `json:"node_id"`
 	Authority        bool        `json:"authority"`
@@ -524,6 +529,65 @@ func (node *Node) ImportAuthorityRecords(records []model.JournalRecord) error {
 	})
 }
 
+func (node *Node) ValidateAuthoritySnapshot(records []model.JournalRecord) (int, error) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	currentLength := 0
+	err := filelock.With(node.authorityLockPath(), func() error {
+		if err := node.reloadAuthorityState(); err != nil {
+			return err
+		}
+		if err := node.authorityJournal.ValidateImport(records); err != nil {
+			return err
+		}
+		currentLength = len(node.authorityJournal.Records())
+		return nil
+	})
+	return currentLength, err
+}
+
+func (node *Node) ImportAuthoritySnapshot(
+	records []model.JournalRecord,
+	transitions []PeerTransition,
+) error {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	return filelock.With(node.authorityLockPath(), func() error {
+		if err := node.reloadAuthorityState(); err != nil {
+			return err
+		}
+		if err := node.authorityJournal.ValidateImport(records); err != nil {
+			return err
+		}
+		for _, incoming := range transitions {
+			if err := node.verifyTransitionIntegrity(incoming.Transition); err != nil {
+				return fmt.Errorf("verify peer transition %s: %w", incoming.Transition.ID, err)
+			}
+			if err := node.verifyReceiptAgainstRecords(incoming.Receipt, incoming.Transition, records); err != nil {
+				return fmt.Errorf("verify peer receipt %s: %w", incoming.Receipt.ID, err)
+			}
+			if err := node.verifyAuthorizationAtReceiptAgainstRecords(
+				incoming.Transition,
+				incoming.Receipt,
+				records,
+			); err != nil {
+				return fmt.Errorf("verify peer authorization %s: %w", incoming.Transition.ID, err)
+			}
+			if err := node.saveTransition(incoming.Transition); err != nil {
+				return err
+			}
+			if err := node.saveReceipt(incoming.Receipt); err != nil {
+				return err
+			}
+		}
+		if err := node.authorityJournal.Import(records); err != nil {
+			return err
+		}
+		node.rebuildAuthorityState()
+		return nil
+	})
+}
+
 func (node *Node) Refs() (map[string]string, map[string]string, error) {
 	node.mu.Lock()
 	defer node.mu.Unlock()
@@ -879,6 +943,14 @@ func (node *Node) verifyTransitionIntegrity(transition model.Transition) error {
 }
 
 func (node *Node) verifyReceipt(receipt model.EdgeReceipt, transition model.Transition) error {
+	return node.verifyReceiptAgainstRecords(receipt, transition, node.authorityJournal.Records())
+}
+
+func (node *Node) verifyReceiptAgainstRecords(
+	receipt model.EdgeReceipt,
+	transition model.Transition,
+	records []model.JournalRecord,
+) error {
 	if receipt.Body.ProtocolVersion != model.ProtocolVersion {
 		return errors.New("unsupported receipt version")
 	}
@@ -915,7 +987,7 @@ func (node *Node) verifyReceipt(receipt model.EdgeReceipt, transition model.Tran
 	if expectedNodeID != receipt.Body.AcceptedBy {
 		return errors.New("receipt node ID mismatch")
 	}
-	if _, err := node.authorityCheckpointSequence(receipt.Body.AuthorityCheckpoint); err != nil {
+	if _, err := authorityCheckpointSequence(records, receipt.Body.AuthorityCheckpoint); err != nil {
 		return err
 	}
 	expectedID, err := model.CanonicalID("receipt:sha256:", receipt.Body)
@@ -929,6 +1001,18 @@ func (node *Node) verifyReceipt(receipt model.EdgeReceipt, transition model.Tran
 }
 
 func (node *Node) verifyAuthorizationAtReceipt(transition model.Transition, receipt model.EdgeReceipt) error {
+	return node.verifyAuthorizationAtReceiptAgainstRecords(
+		transition,
+		receipt,
+		node.authorityJournal.Records(),
+	)
+}
+
+func (node *Node) verifyAuthorizationAtReceiptAgainstRecords(
+	transition model.Transition,
+	receipt model.EdgeReceipt,
+	records []model.JournalRecord,
+) error {
 	acceptedAt := time.Unix(receipt.Body.AcceptedAtUnix, 0).UTC()
 	if err := security.VerifyCapability(
 		node.domain,
@@ -940,8 +1024,9 @@ func (node *Node) verifyAuthorizationAtReceipt(transition model.Transition, rece
 	); err != nil {
 		return err
 	}
-	if revokedSequence, revoked := node.revoked[transition.Body.Capability.ID]; revoked {
-		checkpointSequence, err := node.authorityCheckpointSequence(receipt.Body.AuthorityCheckpoint)
+	revoked := revokedCapabilities(records)
+	if revokedSequence, found := revoked[transition.Body.Capability.ID]; found {
+		checkpointSequence, err := authorityCheckpointSequence(records, receipt.Body.AuthorityCheckpoint)
 		if err != nil {
 			return err
 		}
@@ -950,8 +1035,8 @@ func (node *Node) verifyAuthorizationAtReceipt(transition model.Transition, rece
 		}
 	}
 	if receipt.AcceptanceCapability.ID != "" {
-		if revokedSequence, revoked := node.revoked[receipt.AcceptanceCapability.ID]; revoked {
-			checkpointSequence, err := node.authorityCheckpointSequence(receipt.Body.AuthorityCheckpoint)
+		if revokedSequence, found := revoked[receipt.AcceptanceCapability.ID]; found {
+			checkpointSequence, err := authorityCheckpointSequence(records, receipt.Body.AuthorityCheckpoint)
 			if err != nil {
 				return err
 			}
@@ -1220,15 +1305,29 @@ func (node *Node) authorityCheckpoint() string {
 }
 
 func (node *Node) authorityCheckpointSequence(checkpoint string) (uint64, error) {
+	return authorityCheckpointSequence(node.authorityJournal.Records(), checkpoint)
+}
+
+func authorityCheckpointSequence(records []model.JournalRecord, checkpoint string) (uint64, error) {
 	if checkpoint == "" {
 		return 0, nil
 	}
-	for _, record := range node.authorityJournal.Records() {
+	for _, record := range records {
 		if record.ID == checkpoint {
 			return record.Body.Sequence, nil
 		}
 	}
 	return 0, errors.New("receipt references an unknown authority checkpoint")
+}
+
+func revokedCapabilities(records []model.JournalRecord) map[string]uint64 {
+	revoked := make(map[string]uint64)
+	for _, record := range records {
+		if record.Body.Type == "capability_revoked" {
+			revoked[record.Body.Result] = record.Body.Sequence
+		}
+	}
+	return revoked
 }
 
 func (node *Node) localLockPath() string {

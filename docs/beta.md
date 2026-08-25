@@ -6,15 +6,45 @@ It is not a production availability or security claim.
 ## Install
 
 Download the archive for your platform from the GitHub prerelease, verify its
-adjacent SHA-256 file, and place `fabric` on `PATH`.
+adjacent SHA-256 file, and place `fabric`, `git-remote-fabric`, and `git-fabric`
+on `PATH`. The three entry points may link to the same executable.
 
 Build from source:
 
 ```bash
 go test ./...
 go build -trimpath -o bin/fabric ./cmd/fabric
+ln -f bin/fabric bin/git-remote-fabric
+ln -f bin/fabric bin/git-fabric
 bin/fabric version
 ```
+
+## Git-native interface
+
+The current local-node interface keeps agents on standard Git commands:
+
+```bash
+export PATH="$PWD/bin:$PATH"
+git clone 'fabric:///absolute/path/to/node?namespace=team-repository'
+cd repository
+git fetch origin
+git push origin HEAD
+git fabric status
+git fabric checkpoint
+```
+
+Once installed on `PATH`, `git-remote-fabric` is selected by Git for the
+`fabric://` remote. The beta process-tests clone, fetch, push, checkpoint, and
+status against both a local authority and a local cache hydrated from an
+authenticated HTTP authority peer. It currently requires an absolute local cache
+path and supports SHA-1 repositories only; direct host-addressed discovery and
+SHA-256 remote-helper support remain in progress. Use the explicit `fabric`
+operations below for broader administration.
+
+We do not vendor or fork Git, and hooks are never required for correctness.
+Optional hooks may be added later for convenience. `git-fabric` provides the
+checkpoint and status commands above for State Fabric concepts that cannot be
+expressed as Git operations.
 
 ## Workspace lifecycle
 
@@ -141,6 +171,11 @@ grace longer than the maximum publish delay.
 - no semantic merge engine;
 - GC is offline and policy-light;
 - tracked Git blobs are limited to 32 MiB and larger blobs fail explicitly;
+- Git history bundles are limited to 32 MiB;
+- `git-remote-fabric` requires an absolute local node/cache path and a SHA-1
+  repository, although the cache can hydrate from an HTTP or TLS authority peer;
+- `git-remote-fabric` publishes commit-backed refs under `refs/heads/` only;
+  tag publication and ref deletion fail explicitly;
 - canonical graph-object envelopes are limited to 48 MiB so every stored object
   remains replicable over the v0.1 JSON transport;
 - latency and economics have not yet been validated on a real fleet.

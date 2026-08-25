@@ -3,9 +3,13 @@ package transport
 import (
 	"context"
 	"encoding/pem"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,6 +137,198 @@ func TestThreeNodeReplicationConflictAndConvergence(t *testing.T) {
 	}
 	if divergentA[secondResult.DivergentRef] != second.ID || divergentB[secondResult.DivergentRef] != second.ID {
 		t.Fatal("edges did not preserve divergent head")
+	}
+}
+
+func TestPullTransitionHydratesEmptyEdgeCache(t *testing.T) {
+	root := t.TempDir()
+	authority, err := node.Initialize(filepath.Join(root, "authority"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := authority.Domain().EdgeBundle()
+	edge, err := node.Initialize(filepath.Join(root, "edge"), false, &bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := authority.IssueCapability(
+		authority.PublicKey(),
+		"pull",
+		[]string{"transition.accept"},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, _, err := authority.CreateTransition(node.TransitionRequest{
+		Namespace:  "pull",
+		Roots:      transportRoots(t, authority, "pull"),
+		RefName:    "refs/heads/main",
+		Capability: capability,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Finalize(transition.ID); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewServer(authority).Handler())
+	defer server.Close()
+	client := NewClient(bundle.PeerToken)
+	if err := client.PullAuthority(context.Background(), edge, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.PullTransition(context.Background(), edge, server.URL, transition.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := edge.LoadTransition(transition.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := edge.VerifyObjectClosure(transition.Body.RequiredObjectManifest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPullAuthorityDoesNotPublishRefsBeforeTransitionClosure(t *testing.T) {
+	root := t.TempDir()
+	authority, err := node.Initialize(filepath.Join(root, "authority"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := authority.Domain().EdgeBundle()
+	edge, err := node.Initialize(filepath.Join(root, "edge"), false, &bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := authority.IssueCapability(
+		authority.PublicKey(),
+		"atomic-pull",
+		[]string{"transition.accept"},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, _, err := authority.CreateTransition(node.TransitionRequest{
+		Namespace:  "atomic-pull",
+		Roots:      transportRoots(t, authority, "atomic-pull"),
+		RefName:    "refs/heads/main",
+		Capability: capability,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Finalize(transition.ID); err != nil {
+		t.Fatal(err)
+	}
+	authorityHandler := NewServer(authority).Handler()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v0/transitions/"+url.PathEscape(transition.ID) {
+			http.Error(response, "injected transition failure", http.StatusServiceUnavailable)
+			return
+		}
+		authorityHandler.ServeHTTP(response, request)
+	}))
+	defer server.Close()
+
+	client := NewClient(bundle.PeerToken)
+	if err := client.PullAuthority(context.Background(), edge, server.URL); err == nil {
+		t.Fatal("authority pull unexpectedly succeeded without the referenced transition")
+	}
+	refs, divergent, err := edge.Refs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 || len(divergent) != 0 {
+		t.Fatalf("failed pull published refs: refs=%v divergent=%v", refs, divergent)
+	}
+	records, err := edge.AuthorityRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("failed pull published %d authority records", len(records))
+	}
+}
+
+func TestPullAuthorityFetchesOnlyValidatedJournalSuffix(t *testing.T) {
+	root := t.TempDir()
+	authority, err := node.Initialize(filepath.Join(root, "authority"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := authority.Domain().EdgeBundle()
+	edge, err := node.Initialize(filepath.Join(root, "edge"), false, &bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := authority.IssueCapability(
+		authority.PublicKey(),
+		"incremental-pull",
+		[]string{"transition.accept"},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := authority.CreateTransition(node.TransitionRequest{
+		Namespace:  "incremental-pull",
+		Roots:      transportRoots(t, authority, "first"),
+		RefName:    "refs/heads/main",
+		Capability: capability,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Finalize(first.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var transitionRequests atomic.Int64
+	authorityHandler := NewServer(authority).Handler()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/v0/transitions/") {
+			transitionRequests.Add(1)
+		}
+		authorityHandler.ServeHTTP(response, request)
+	}))
+	defer server.Close()
+	client := NewClient(bundle.PeerToken)
+	if err := client.PullAuthority(context.Background(), edge, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got := transitionRequests.Load(); got != 1 {
+		t.Fatalf("initial pull fetched %d transitions, want 1", got)
+	}
+
+	transitionRequests.Store(0)
+	if err := client.PullAuthority(context.Background(), edge, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got := transitionRequests.Load(); got != 0 {
+		t.Fatalf("unchanged journal re-fetched %d transitions", got)
+	}
+
+	second, _, err := authority.CreateTransition(node.TransitionRequest{
+		Namespace:         "incremental-pull",
+		Roots:             transportRoots(t, authority, "second"),
+		ParentTransitions: []string{first.ID},
+		RefName:           "refs/heads/main",
+		Expected:          first.ID,
+		Capability:        capability,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Finalize(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	transitionRequests.Store(0)
+	if err := client.PullAuthority(context.Background(), edge, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got := transitionRequests.Load(); got != 1 {
+		t.Fatalf("incremental pull fetched %d transitions, want only the new suffix transition", got)
 	}
 }
 
