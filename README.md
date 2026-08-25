@@ -2,6 +2,18 @@
 
 **Warm, forkable workspace state for coding-agent fleets.**
 
+## The dream demo
+
+[![State Fabric hero demo: one Git workflow, two machines, durable state](docs/assets/state-fabric-hero-poster.png)](docs/assets/state-fabric-offbox-hero.mp4)
+
+**[Watch the 45-second hero demo](docs/assets/state-fabric-offbox-hero.mp4)**
+
+One Git workflow, two machines, durable state. This real off-box run starts with
+an ordinary `git push` on this host, clones and changes the repository on a
+remote Linux machine, pushes the result back, then hydrates a brand-new local
+cache. Both sides verify the same 15 objects, 2 signed transitions, and 2
+durability receipts. The agents only use Git.
+
 State Fabric v0.1 is an OSS public beta of a protocol that makes three
 content-addressed
 graphs canonical:
