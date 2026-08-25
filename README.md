@@ -1,6 +1,6 @@
 # State Fabric
 
-**Agent-native distributed state, accepted nearby and verified everywhere.**
+**Warm, forkable workspace state for coding-agent fleets.**
 
 State Fabric is an OSS v0 of a protocol that makes three content-addressed
 graphs canonical:
@@ -11,6 +11,12 @@ graphs canonical:
 
 A signed Authority Journal finalizes transitions between those roots. Git is a
 compatibility adapter rather than the internal storage model.
+
+The product bet is that a fleet should be able to fork a complete warm workspace
+near compute, run without reconstructing it from an origin, and preserve every
+divergent result. The current v0 establishes the protocol and durability
+foundation for that workflow; constant-time workspace forks and demand hydration
+are the next product gate.
 
 This repository contains a real single-binary implementation of the v0
 semantics. It does not require Kubernetes, an external database, a blockchain,
@@ -25,10 +31,12 @@ locking is intentionally deferred.
 go run ./cmd/fabric demo
 ```
 
-The demo creates three isolated nodes and uses real HTTP replication:
+The demo creates three isolated nodes in one process and uses HTTP replication
+over loopback:
 
 1. Two edges accept conflicting agent state while the authority is unavailable.
-2. Each edge returns a signed, fsynced durability receipt.
+2. Each edge self-accepts its transition and returns a signed, fsynced
+   host-disk receipt.
 3. One edge restarts and proves the acknowledged state survived.
 4. Both histories replicate to the authority.
 5. One becomes the shared ref; the other is preserved as a divergent head.
@@ -148,6 +156,15 @@ not part of v0.
 | Git adapter preserves supported tracked bytes and blob identities | Implemented and tested |
 | No incumbent service dependency | Implemented |
 
+## What v0 does not yet prove
+
+- constant-time workspace forks or demand-paged hydration;
+- an independent edge accepting work on behalf of a distinct actor;
+- multi-host latency, cache-hit, or origin-byte targets;
+- acceptable reconciliation cost with many concurrent agents;
+- production transport security, garbage collection, retention, or KMS-backed
+  keys.
+
 This is an OSS v0, not a production security or availability claim. See
 [docs/protocol.md](docs/protocol.md) for exact scope and deferred work.
 
@@ -156,6 +173,7 @@ This is an OSS v0, not a production security or availability claim. See
 - [v0 protocol and architecture](docs/protocol.md)
 - [security and trust domains](docs/security.md)
 - [three-node demo](docs/demo.md)
+- [product roadmap and prioritized backlog](docs/roadmap.md)
 
 ## License
 

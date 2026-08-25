@@ -85,6 +85,10 @@ v0 advertises `host-disk`. It means all required objects, the transition, the
 receipt, and the accepted journal event were fsynced before the receipt was
 returned.
 
+In v0, the receipt signer must be the capability subject and transition actor.
+The implementation therefore proves node-local self-acceptance, not yet an
+independent edge attesting durability on behalf of a remote actor.
+
 ## Authority journal
 
 The journal is append-only canonical JSONL. Every record includes:
@@ -139,5 +143,7 @@ rejected rather than silently replaced.
 - Git and workspace paths must be valid UTF-8 in v0; unsupported paths are
   rejected rather than lossy-normalized.
 - Workspace snapshots are whole-file objects, not yet per-extent SV3 layers.
+- Independent edge acceptance, where receipt signer and transition actor are
+  distinct authorized identities, is deferred.
 - No cache eviction, placement prediction, transparency witnesses, or semantic
   merge engine.
